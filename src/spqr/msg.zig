@@ -37,6 +37,7 @@ pub const V1Msg = struct {
     epoch: u64,
     chain_index: u32,
     payload: Payload,
+    mac: ?[32]u8 = null, // HMAC-SHA256 over full object; present only on index-0 authenticated chunks
 };
 
 pub fn serialize(allocator: mem.Allocator, msg: V1Msg) ![]u8 {
@@ -55,6 +56,8 @@ pub fn serialize(allocator: mem.Allocator, msg: V1Msg) ![]u8 {
         .ct1 => |c| try writeChunk(&enc, 7, c),
         .ct2 => |c| try writeChunk(&enc, 8, c),
     }
+
+    if (msg.mac) |m| try enc.writeBytesField(9, &m);
 
     const pb_bytes = try enc.toOwnedSlice();
     defer allocator.free(pb_bytes);
@@ -121,6 +124,9 @@ pub fn parse(data: []const u8) ParseError!V1Msg {
             },
             8 => if (field.wire_type == .len) {
                 msg.payload = .{ .ct2 = try parseChunk(field.data.len) };
+            },
+            9 => if (field.wire_type == .len and field.data.len.len == 32) {
+                msg.mac = field.data.len[0..32].*;
             },
             else => {},
         }

@@ -96,6 +96,7 @@ pub const Chain = struct {
         HkdfSha256.expand(&out, LABEL, prk);
         @memcpy(&self.next_root, out[0..32]);
         self.current_epoch = epoch;
+        self.send_epoch = epoch;
         const send_start: [32]u8 = if (self.dir == .a2b) out[32..64].* else out[64..96].*;
         const recv_start: [32]u8 = if (self.dir == .a2b) out[64..96].* else out[32..64].*;
         try self.links.append(allocator, .{

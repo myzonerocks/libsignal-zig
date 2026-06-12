@@ -1,10 +1,22 @@
 // SPQR V1 state machine: ML-KEM-768 key exchange across chunked messages.
 //
-// A2B epoch (Alice generates ML-KEM keys):
+// A2B epoch (Alice generates ML-KEM keys, sends HDR + EK):
 //   unsampled → hdr_sending → ek_sending → ek_sending_ct1 → waiting_ct2
 //
-// B2A epoch (Bob encapsulates):
-//   waiting_hdr → ct1_sending → ct2_sending → (back to unsampled, role flip)
+// B2A epoch (Bob encapsulates, sends CT1 + CT2):
+//   waiting_hdr → ct1_sending → ct2_sending → (unsampled, roles swap each epoch)
+//
+// MAC invariant: all four objects (HDR, EK, CT1, CT2) within one epoch are
+// authenticated with the mac_key established at the START of that epoch.
+// auth.update() must not be called until the epoch exchange is fully complete
+// (Alice: after decaps; Bob: after receiving ct1_ack confirming Alice has CT2).
+// This keeps both sides' mac_keys in sync throughout the exchange.
+//
+// Transport assumption: SPQR relies on the underlying transport (Signal Noise
+// protocol over TCP) to deliver messages reliably and in order. The Lagrange
+// polynomial codec provides recovery from chunk reordering but not from loss.
+// A lost index-0 chunk means the associated MAC cannot be verified; the epoch
+// exchange will fail and must be restarted.
 const std = @import("std");
 const mem = std.mem;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
@@ -31,7 +43,6 @@ fn sckaDeriveKey(ss: [32]u8, ep: u64) [32]u8 {
     return out;
 }
 
-// State tag byte for serialization
 pub const StateTag = enum(u8) {
     unsampled = 0,
     hdr_sending = 1,
@@ -43,7 +54,6 @@ pub const StateTag = enum(u8) {
     ct2_sending = 7,
 };
 
-// Complete SPQR state: chain + authenticator + ML-KEM state machine
 pub const SpqrState = struct {
     chain: chain_mod.Chain,
     auth: auth_mod.Authenticator,
@@ -95,11 +105,18 @@ pub const RecvResult = struct {
     chain_key: ?[32]u8,
 };
 
+// Payload + optional MAC returned by nextSendChunk; MAC present only on index-0
+// chunks of authenticated objects (HDR, EK, CT1, CT2).
+pub const ChunkSend = struct {
+    payload: msg_mod.Payload,
+    mac: ?auth_mod.Mac,
+};
+
 pub fn send(allocator: mem.Allocator, state: *SpqrState) !SendResult {
     const ep = state.chain.current_epoch;
     const send_ep = state.chain.send_epoch;
 
-    const payload = try state.sm.nextSendChunk(allocator, &state.auth, ep);
+    const chunk = try state.sm.nextSendChunk(allocator, &state.auth, ep);
 
     const sk = state.chain.sendKey(send_ep) catch
         return SendResult{ .msg_bytes = try allocator.dupe(u8, &.{}), .chain_key = null };
@@ -107,7 +124,8 @@ pub fn send(allocator: mem.Allocator, state: *SpqrState) !SendResult {
     const v1msg = msg_mod.V1Msg{
         .epoch = send_ep,
         .chain_index = sk.index,
-        .payload = payload,
+        .payload = chunk.payload,
+        .mac = chunk.mac,
     };
     const msg_bytes = try msg_mod.serialize(allocator, v1msg);
     return SendResult{ .msg_bytes = msg_bytes, .chain_key = sk.key };
@@ -118,7 +136,7 @@ pub fn recv(allocator: mem.Allocator, state: *SpqrState, data: []const u8) !Recv
     const ep = v1msg.epoch;
     const idx = v1msg.chain_index;
 
-    try state.sm.receiveChunk(allocator, &state.auth, &state.chain, v1msg.payload, ep);
+    try state.sm.receiveChunk(allocator, &state.auth, &state.chain, v1msg.payload, v1msg.mac, ep);
 
     const chain_key = state.chain.recvKey(ep, idx) catch null;
     return RecvResult{ .chain_key = chain_key };
@@ -147,21 +165,21 @@ pub const StateMachine = union(StateTag) {
         _ = allocator;
     }
 
-    // Returns the next chunk payload to send.
+    // Returns the next chunk + MAC to send. MAC is non-null only for the index-0
+    // chunk of each authenticated object (HDR, EK, CT1, CT2).
     pub fn nextSendChunk(
         self: *StateMachine,
         allocator: mem.Allocator,
         auth: *auth_mod.Authenticator,
         ep: u64,
-    ) !msg_mod.Payload {
-        _ = auth;
+    ) !ChunkSend {
         switch (self.*) {
             .unsampled => {
-                // Generate ML-KEM keypair, start sending header
                 const keys = mlkem.generate();
                 var hdr_enc = try poly.PolyEncoder.init(allocator, &keys.hdr);
-                const c = hdr_enc.nextChunk();
+                const c = hdr_enc.nextChunk(); // index 0
                 const ct1_dec = try poly.PolyDecoder.init(mlkem.CT1_SIZE);
+                const mac = auth.macHdr(ep, &keys.hdr);
                 self.* = StateMachine{ .hdr_sending = .{
                     .hdr = keys.hdr,
                     .ek = keys.ek,
@@ -169,37 +187,39 @@ pub const StateMachine = union(StateTag) {
                     .hdr_enc = hdr_enc,
                     .ct1_dec = ct1_dec,
                 } };
-                return msg_mod.Payload{ .hdr = .{ .index = c.index, .data = c.data } };
+                return ChunkSend{ .payload = .{ .hdr = .{ .index = c.index, .data = c.data } }, .mac = mac };
             },
             .hdr_sending => |*s| {
                 if (s.hdr_enc.idx * poly.CHUNK_SIZE >= s.hdr_enc.msg.len) {
-                    // Header fully sent; switch to EK
-                    var enc = s.hdr_enc;
-                    enc.deinit();
+                    // Header fully sent; pivot to EK. First EK chunk carries MAC.
+                    var old_enc = s.hdr_enc;
+                    old_enc.deinit();
                     const ek_copy = s.ek;
                     const dk_copy = s.dk;
                     const ct1_dec_copy = s.ct1_dec;
                     var ek_enc = try poly.PolyEncoder.init(allocator, &ek_copy);
-                    const c = ek_enc.nextChunk();
+                    const c = ek_enc.nextChunk(); // index 0
+                    const mac = auth.macCt(ep, &ek_copy);
                     self.* = StateMachine{ .ek_sending = .{
                         .ek = ek_copy,
                         .dk = dk_copy,
                         .ek_enc = ek_enc,
                         .ct1_dec = ct1_dec_copy,
                     } };
-                    return msg_mod.Payload{ .ek = .{ .index = c.index, .data = c.data } };
+                    return ChunkSend{ .payload = .{ .ek = .{ .index = c.index, .data = c.data } }, .mac = mac };
                 }
-                const c = s.hdr_enc.nextChunk();
-                return msg_mod.Payload{ .hdr = .{ .index = c.index, .data = c.data } };
+                const c = s.hdr_enc.nextChunk(); // index > 0
+                return ChunkSend{ .payload = .{ .hdr = .{ .index = c.index, .data = c.data } }, .mac = null };
             },
             .ek_sending => |*s| {
+                // EK encoder index > 0 on entry (first chunk was sent in hdr_sending transition)
                 const c = s.ek_enc.nextChunk();
                 const payload = msg_mod.Payload{ .ek = .{ .index = c.index, .data = c.data } };
                 if (s.ek_enc.idx * poly.CHUNK_SIZE >= s.ek_enc.msg.len) {
                     const ek_copy = s.ek;
                     const dk_copy = s.dk;
-                    var enc = s.ek_enc;
-                    enc.deinit();
+                    var old_enc = s.ek_enc;
+                    old_enc.deinit();
                     self.* = StateMachine{ .waiting_ct2 = .{
                         .dk = dk_copy,
                         .ct1 = null,
@@ -208,16 +228,16 @@ pub const StateMachine = union(StateTag) {
                         .ek = ek_copy,
                     } };
                 }
-                return payload;
+                return ChunkSend{ .payload = payload, .mac = null };
             },
             .ek_sending_ct1 => |*s| {
-                // Send EkCt1Ack (EK chunk signaling CT1 receipt)
+                // EK encoder picks up mid-stream; MAC already sent with index-0 chunk.
                 const c = s.ek_enc.nextChunk();
                 const payload = msg_mod.Payload{ .ek_ct1_ack = .{ .index = c.index, .data = c.data } };
                 if (s.ek_enc.idx * poly.CHUNK_SIZE >= s.ek_enc.msg.len) {
                     const ct1_copy = s.ct1;
-                    var enc = s.ek_enc;
-                    enc.deinit();
+                    var old_enc = s.ek_enc;
+                    old_enc.deinit();
                     self.* = StateMachine{ .waiting_ct2 = .{
                         .dk = s.dk,
                         .ct1 = ct1_copy,
@@ -226,109 +246,121 @@ pub const StateMachine = union(StateTag) {
                         .ek = s.ek,
                     } };
                 }
-                return payload;
+                return ChunkSend{ .payload = payload, .mac = null };
             },
             .waiting_ct2 => |*s| {
-                if (s.ct1 != null) {
-                    return msg_mod.Payload{ .ct1_ack = true };
-                }
-                return msg_mod.Payload{ .none = {} };
+                if (s.ct1 != null) return ChunkSend{ .payload = .{ .ct1_ack = true }, .mac = null };
+                return ChunkSend{ .payload = .{ .none = {} }, .mac = null };
             },
-            .waiting_hdr => return msg_mod.Payload{ .none = {} },
+            .waiting_hdr => return ChunkSend{ .payload = .{ .none = {} }, .mac = null },
             .ct1_sending => |*s| {
-                // If full EK received, compute CT2 and transition
                 if (s.full_ek) |ek| {
+                    // EK fully received; compute CT2 and transition. First CT2 chunk carries MAC.
                     const ct2 = mlkem.encaps2(&ek, &s.es);
-                    var ct1_enc = s.ct1_enc;
-                    ct1_enc.deinit();
+                    var old_enc = s.ct1_enc;
+                    old_enc.deinit();
                     var ct2_enc = try poly.PolyEncoder.init(allocator, &ct2);
-                    const c = ct2_enc.nextChunk();
+                    const c = ct2_enc.nextChunk(); // index 0
+                    const mac = auth.macCt(ep, &ct2);
                     const ss_copy = s.ss;
                     self.* = StateMachine{ .ct2_sending = .{
                         .ct2_enc = ct2_enc,
                         .ss = ss_copy,
                         .ep = ep,
                     } };
-                    return msg_mod.Payload{ .ct2 = .{ .index = c.index, .data = c.data } };
+                    return ChunkSend{ .payload = .{ .ct2 = .{ .index = c.index, .data = c.data } }, .mac = mac };
                 }
-                // Still sending CT1
                 if (s.ct1_enc.idx * poly.CHUNK_SIZE < s.ct1_enc.msg.len) {
                     const c = s.ct1_enc.nextChunk();
-                    return msg_mod.Payload{ .ct1 = .{ .index = c.index, .data = c.data } };
+                    // MAC on index-0 only
+                    const mac: ?auth_mod.Mac = if (c.index == 0) auth.macCt(ep, s.ct1_enc.msg) else null;
+                    return ChunkSend{ .payload = .{ .ct1 = .{ .index = c.index, .data = c.data } }, .mac = mac };
                 }
-                // CT1 fully sent, waiting for EK
-                return msg_mod.Payload{ .ct1_ack = true };
+                return ChunkSend{ .payload = .{ .ct1_ack = true }, .mac = null };
             },
             .ct2_sending => |*s| {
+                // CT2 encoder index > 0 on entry (first chunk sent in ct1_sending transition)
                 if (s.ct2_enc.idx * poly.CHUNK_SIZE < s.ct2_enc.msg.len) {
                     const c = s.ct2_enc.nextChunk();
-                    return msg_mod.Payload{ .ct2 = .{ .index = c.index, .data = c.data } };
+                    return ChunkSend{ .payload = .{ .ct2 = .{ .index = c.index, .data = c.data } }, .mac = null };
                 }
-                return msg_mod.Payload{ .none = {} };
+                return ChunkSend{ .payload = .{ .none = {} }, .mac = null };
             },
         }
     }
 
-    // Process an incoming V1Msg chunk.
+    // Process an incoming V1Msg chunk. mac is non-null on index-0 authenticated chunks;
+    // it is stored until the full object is assembled, then verified.
     pub fn receiveChunk(
         self: *StateMachine,
         allocator: mem.Allocator,
         auth: *auth_mod.Authenticator,
         chain: *chain_mod.Chain,
         payload: msg_mod.Payload,
+        mac: ?[32]u8,
         ep: u64,
     ) !void {
         switch (self.*) {
-            .unsampled, .hdr_sending, .ek_sending_ct1 => {
-                // Can receive CT1 but don't store it yet (no hdr/ek state ready)
-                // Ignore; SPQR is tolerant of dropped/out-of-order chunks
-            },
+            // These states only send; incoming chunks (typically retransmissions) are ignored.
+            .unsampled, .hdr_sending, .ek_sending_ct1 => {},
             .ek_sending => |*s| {
-                if (payload == .ct1) {
-                    const c = payload.ct1;
-                    const pc = poly.Chunk{ .index = c.index, .data = c.data };
-                    s.ct1_dec.addChunk(&pc);
-                    const maybe = try s.ct1_dec.decodedMessage(allocator);
-                    if (maybe) |bytes| {
-                        defer allocator.free(bytes);
-                        if (bytes.len == mlkem.CT1_SIZE) {
-                            var ct1: [mlkem.CT1_SIZE]u8 = undefined;
-                            @memcpy(&ct1, bytes);
-                            // CT1 received while sending EK → switch to ek_sending_ct1
-                            const ek_copy = s.ek;
-                            const dk_copy = s.dk;
-                            const enc_copy = s.ek_enc;
-                            self.* = StateMachine{ .ek_sending_ct1 = .{
-                                .ek = ek_copy,
-                                .dk = dk_copy,
-                                .ek_enc = enc_copy,
-                                .ct1 = ct1,
-                            } };
-                        }
+                if (payload != .ct1) return;
+                const c = payload.ct1;
+                // Capture MAC from index-0 CT1 chunk
+                if (c.index == 0) {
+                    if (mac == null) return error.MissingMac;
+                    s.pending_mac_ct1 = mac;
+                }
+                const pc = poly.Chunk{ .index = c.index, .data = c.data };
+                s.ct1_dec.addChunk(&pc);
+                const maybe = try s.ct1_dec.decodedMessage(allocator);
+                if (maybe) |bytes| {
+                    defer allocator.free(bytes);
+                    if (bytes.len == mlkem.CT1_SIZE) {
+                        const pm = s.pending_mac_ct1 orelse return error.MissingMac;
+                        try auth.verifyCt(ep, bytes, &pm);
+                        var ct1: [mlkem.CT1_SIZE]u8 = undefined;
+                        @memcpy(&ct1, bytes);
+                        const enc_copy = s.ek_enc;
+                        self.* = StateMachine{ .ek_sending_ct1 = .{
+                            .ek = s.ek,
+                            .dk = s.dk,
+                            .ek_enc = enc_copy,
+                            .ct1 = ct1,
+                        } };
                     }
                 }
             },
             .waiting_ct2 => |*s| {
                 switch (payload) {
                     .ct1 => |c| {
-                        if (s.ct1 == null) {
-                            if (s.ct1_dec) |*dec| {
-                                const pc = poly.Chunk{ .index = c.index, .data = c.data };
-                                dec.addChunk(&pc);
-                                const maybe = try dec.decodedMessage(allocator);
-                                if (maybe) |bytes| {
-                                    defer allocator.free(bytes);
-                                    if (bytes.len == mlkem.CT1_SIZE) {
-                                        var ct1: [mlkem.CT1_SIZE]u8 = undefined;
-                                        @memcpy(&ct1, bytes);
-                                        s.ct1 = ct1;
-                                        s.ct1_dec = null;
-                                    }
+                        if (s.ct1 != null) return; // already have CT1
+                        if (c.index == 0) {
+                            if (mac == null) return error.MissingMac;
+                            s.pending_mac_ct1 = mac;
+                        }
+                        if (s.ct1_dec) |*dec| {
+                            const pc = poly.Chunk{ .index = c.index, .data = c.data };
+                            dec.addChunk(&pc);
+                            const maybe = try dec.decodedMessage(allocator);
+                            if (maybe) |bytes| {
+                                defer allocator.free(bytes);
+                                if (bytes.len == mlkem.CT1_SIZE) {
+                                    const pm = s.pending_mac_ct1 orelse return error.MissingMac;
+                                    try auth.verifyCt(ep, bytes, &pm);
+                                    var ct1: [mlkem.CT1_SIZE]u8 = undefined;
+                                    @memcpy(&ct1, bytes);
+                                    s.ct1 = ct1;
+                                    s.ct1_dec = null;
                                 }
                             }
                         }
                     },
                     .ct2 => |c| {
+                        if (c.index == 0) {
+                            if (mac == null) return error.MissingMac;
+                            s.pending_mac_ct2 = mac;
+                        }
                         const pc = poly.Chunk{ .index = c.index, .data = c.data };
                         s.ct2_dec.addChunk(&pc);
                         const maybe = try s.ct2_dec.decodedMessage(allocator);
@@ -338,13 +370,17 @@ pub const StateMachine = union(StateTag) {
                                 if (s.ct1) |ct1| {
                                     var ct2: [mlkem.CT2_SIZE]u8 = undefined;
                                     @memcpy(&ct2, bytes);
-                                    // Decapsulate
+                                    // Verify CT2 MAC before decapsulating
+                                    const pm = s.pending_mac_ct2 orelse return error.MissingMac;
+                                    try auth.verifyCt(ep, bytes, &pm);
                                     const ss_raw = try mlkem.decaps(&s.dk, &ct1, &ct2);
-                                    const next_ep = ep + 1;
-                                    const epoch_key = sckaDeriveKey(ss_raw, next_ep);
-                                    try chain.addEpoch(allocator, next_ep, epoch_key);
-                                    auth.update(next_ep, epoch_key);
-                                    // Next epoch: Alice becomes CT1 sender (B2A)
+                                    // ep IS the new epoch (Bob's send_epoch after his chain advanced).
+                                    // Alice adds the same epoch number Bob already added on his side.
+                                    const epoch_key = sckaDeriveKey(ss_raw, ep);
+                                    try chain.addEpoch(allocator, ep, epoch_key);
+                                    // auth.update deferred: Alice updates after decaps, Bob updates at ct1_ack.
+                                    // Both sides are still on epoch-0 mac_key so this call is correct here.
+                                    auth.update(ep, epoch_key);
                                     self.* = StateMachine{ .waiting_hdr = .{
                                         .hdr_dec = try poly.PolyDecoder.init(mlkem.HEADER_SIZE),
                                     } };
@@ -357,35 +393,42 @@ pub const StateMachine = union(StateTag) {
                 }
             },
             .waiting_hdr => |*s| {
-                if (payload == .hdr) {
-                    const c = payload.hdr;
-                    const pc = poly.Chunk{ .index = c.index, .data = c.data };
-                    s.hdr_dec.addChunk(&pc);
-                    const maybe = try s.hdr_dec.decodedMessage(allocator);
-                    if (maybe) |bytes| {
-                        defer allocator.free(bytes);
-                        if (bytes.len == mlkem.HEADER_SIZE) {
-                            var hdr: [mlkem.HEADER_SIZE]u8 = undefined;
-                            @memcpy(&hdr, bytes);
-                            // Encaps1: compute CT1, EncapsState, and epoch secret
-                            var m_seed: [32]u8 = undefined;
-                            rnd.bytes(&m_seed);
-                            const encaps = mlkem.encaps1(&hdr, &m_seed);
-                            // Inject epoch secret immediately (Bob knows ss from encaps1)
-                            const next_ep = ep + 1;
-                            const epoch_key = sckaDeriveKey(encaps.ss, next_ep);
-                            try chain.addEpoch(allocator, next_ep, epoch_key);
-                            auth.update(next_ep, epoch_key);
-                            const ct1_enc = try poly.PolyEncoder.init(allocator, &encaps.ct1);
-                            self.* = StateMachine{ .ct1_sending = .{
-                                .ct1_enc = ct1_enc,
-                                .ek_dec = try poly.PolyDecoder.init(mlkem.EK_SIZE),
-                                .es = encaps.es,
-                                .ss = encaps.ss,
-                                .full_ek = null,
-                                .ek_ct1_ack_received = false,
-                            } };
-                        }
+                if (payload != .hdr) return;
+                const c = payload.hdr;
+                if (c.index == 0) {
+                    if (mac == null) return error.MissingMac;
+                    s.pending_mac = mac;
+                }
+                const pc = poly.Chunk{ .index = c.index, .data = c.data };
+                s.hdr_dec.addChunk(&pc);
+                const maybe = try s.hdr_dec.decodedMessage(allocator);
+                if (maybe) |bytes| {
+                    defer allocator.free(bytes);
+                    if (bytes.len == mlkem.HEADER_SIZE) {
+                        var hdr: [mlkem.HEADER_SIZE]u8 = undefined;
+                        @memcpy(&hdr, bytes);
+                        // Verify HDR MAC before trusting the key material
+                        const pm = s.pending_mac orelse return error.MissingMac;
+                        try auth.verifyHdr(ep, &hdr, &pm);
+                        var m_seed: [32]u8 = undefined;
+                        rnd.bytes(&m_seed);
+                        const encaps = mlkem.encaps1(&hdr, &m_seed);
+                        // Inject epoch secret into chain for message-key forward secrecy.
+                        // auth.update is intentionally deferred to ct2_sending.receiveChunk
+                        // so that CT1 and CT2 MACs are verified with the current (pre-update)
+                        // mac_key, keeping Alice and Bob in sync throughout this epoch.
+                        const next_ep = ep + 1;
+                        const epoch_key = sckaDeriveKey(encaps.ss, next_ep);
+                        try chain.addEpoch(allocator, next_ep, epoch_key);
+                        const ct1_enc = try poly.PolyEncoder.init(allocator, &encaps.ct1);
+                        self.* = StateMachine{ .ct1_sending = .{
+                            .ct1_enc = ct1_enc,
+                            .ek_dec = try poly.PolyDecoder.init(mlkem.EK_SIZE),
+                            .es = encaps.es,
+                            .ss = encaps.ss,
+                            .full_ek = null,
+                            .ek_ct1_ack_received = false,
+                        } };
                     }
                 }
             },
@@ -393,17 +436,22 @@ pub const StateMachine = union(StateTag) {
                 switch (payload) {
                     .ek, .ek_ct1_ack => |c| {
                         if (payload == .ek_ct1_ack) s.ek_ct1_ack_received = true;
-                        if (s.full_ek == null) {
-                            const pc = poly.Chunk{ .index = c.index, .data = c.data };
-                            s.ek_dec.addChunk(&pc);
-                            const maybe = try s.ek_dec.decodedMessage(allocator);
-                            if (maybe) |ek_bytes| {
-                                defer allocator.free(ek_bytes);
-                                if (ek_bytes.len == mlkem.EK_SIZE) {
-                                    var ek: [mlkem.EK_SIZE]u8 = undefined;
-                                    @memcpy(&ek, ek_bytes);
-                                    s.full_ek = ek;
-                                }
+                        if (s.full_ek != null) return; // already have EK
+                        if (c.index == 0) {
+                            if (mac == null) return error.MissingMac;
+                            s.pending_mac_ek = mac;
+                        }
+                        const pc = poly.Chunk{ .index = c.index, .data = c.data };
+                        s.ek_dec.addChunk(&pc);
+                        const maybe = try s.ek_dec.decodedMessage(allocator);
+                        if (maybe) |ek_bytes| {
+                            defer allocator.free(ek_bytes);
+                            if (ek_bytes.len == mlkem.EK_SIZE) {
+                                const pm = s.pending_mac_ek orelse return error.MissingMac;
+                                try auth.verifyCt(ep, ek_bytes, &pm);
+                                var ek: [mlkem.EK_SIZE]u8 = undefined;
+                                @memcpy(&ek, ek_bytes);
+                                s.full_ek = ek;
                             }
                         }
                     },
@@ -412,13 +460,17 @@ pub const StateMachine = union(StateTag) {
                 }
             },
             .ct2_sending => |*s| {
-                if (payload == .ct1_ack) {
-                    // Alice acked CT2; Bob's epoch was already injected at encaps1.
-                    // Transition to unsampled for next epoch (Bob generates keys).
-                    var enc = s.ct2_enc;
-                    enc.deinit();
-                    self.* = StateMachine{ .unsampled = {} };
-                }
+                if (payload != .ct1_ack) return;
+                // Alice sends ct1_ack as soon as she enters waiting_ct2 (CT1 acknowledged),
+                // but Bob must not advance until CT2 is fully transmitted — otherwise he frees
+                // the encoder before Alice has received all chunks.
+                if (s.ct2_enc.idx * poly.CHUNK_SIZE < s.ct2_enc.msg.len) return;
+                // CT2 fully sent and Alice confirmed receipt. Safe to advance auth.
+                const epoch_key = sckaDeriveKey(s.ss, s.ep);
+                auth.update(s.ep, epoch_key);
+                var old_enc = s.ct2_enc;
+                old_enc.deinit();
+                self.* = StateMachine{ .unsampled = {} };
             },
         }
     }
@@ -439,6 +491,7 @@ pub const StateMachine = union(StateTag) {
                 try buf.appendSlice(a, &s.dk);
                 try poly.serializeEncoder(&s.ek_enc, buf, a);
                 try s.ct1_dec.serialize(buf, a);
+                try serializeMac(s.pending_mac_ct1, buf, a);
             },
             .ek_sending_ct1 => |*s| {
                 try buf.appendSlice(a, &s.ek);
@@ -456,9 +509,12 @@ pub const StateMachine = union(StateTag) {
                 const has_dec: u8 = if (s.ct1_dec != null) 1 else 0;
                 try buf.append(a, has_dec);
                 if (s.ct1_dec) |*dec| try dec.serialize(buf, a);
+                try serializeMac(s.pending_mac_ct1, buf, a);
+                try serializeMac(s.pending_mac_ct2, buf, a);
             },
             .waiting_hdr => |*s| {
                 try s.hdr_dec.serialize(buf, a);
+                try serializeMac(s.pending_mac, buf, a);
             },
             .ct1_sending => |*s| {
                 try poly.serializeEncoder(&s.ct1_enc, buf, a);
@@ -469,6 +525,7 @@ pub const StateMachine = union(StateTag) {
                 try buf.append(a, has_ek);
                 if (s.full_ek) |ek| try buf.appendSlice(a, &ek);
                 try buf.append(a, if (s.ek_ct1_ack_received) 1 else 0);
+                try serializeMac(s.pending_mac_ek, buf, a);
             },
             .ct2_sending => |*s| {
                 try poly.serializeEncoder(&s.ct2_enc, buf, a);
@@ -497,7 +554,6 @@ pub const StateMachine = union(StateTag) {
                 const enc_r = try poly.deserializeEncoder(allocator, data[pos..]);
                 pos += enc_r.consumed;
                 const dec_r = try poly.PolyDecoder.deserialize(data[pos..]);
-                _ = dec_r.consumed;
                 return StateMachine{ .hdr_sending = .{
                     .hdr = hdr,
                     .ek = ek,
@@ -515,11 +571,14 @@ pub const StateMachine = union(StateTag) {
                 const enc_r = try poly.deserializeEncoder(allocator, data[pos..]);
                 pos += enc_r.consumed;
                 const dec_r = try poly.PolyDecoder.deserialize(data[pos..]);
+                pos += dec_r.consumed;
+                const pending_mac_ct1 = try deserializeMac(data, &pos);
                 return StateMachine{ .ek_sending = .{
                     .ek = ek,
                     .dk = dk,
                     .ek_enc = enc_r.enc,
                     .ct1_dec = dec_r.dec,
+                    .pending_mac_ct1 = pending_mac_ct1,
                 } };
             },
             .ek_sending_ct1 => {
@@ -564,17 +623,23 @@ pub const StateMachine = union(StateTag) {
                     pos += r.consumed;
                     ct1_dec = r.dec;
                 }
+                const pending_mac_ct1 = try deserializeMac(data, &pos);
+                const pending_mac_ct2 = try deserializeMac(data, &pos);
                 return StateMachine{ .waiting_ct2 = .{
                     .dk = dk,
                     .ek = ek,
                     .ct1 = ct1,
                     .ct2_dec = ct2_r.dec,
                     .ct1_dec = ct1_dec,
+                    .pending_mac_ct1 = pending_mac_ct1,
+                    .pending_mac_ct2 = pending_mac_ct2,
                 } };
             },
             .waiting_hdr => {
                 const r = try poly.PolyDecoder.deserialize(data[pos..]);
-                return StateMachine{ .waiting_hdr = .{ .hdr_dec = r.dec } };
+                pos += r.consumed;
+                const pending_mac = try deserializeMac(data, &pos);
+                return StateMachine{ .waiting_hdr = .{ .hdr_dec = r.dec, .pending_mac = pending_mac } };
             },
             .ct1_sending => {
                 const enc_r = try poly.deserializeEncoder(allocator, data[pos..]);
@@ -596,6 +661,8 @@ pub const StateMachine = union(StateTag) {
                 }
                 if (pos + 1 > data.len) return error.TooShort;
                 const acked = data[pos] != 0;
+                pos += 1;
+                const pending_mac_ek = try deserializeMac(data, &pos);
                 return StateMachine{ .ct1_sending = .{
                     .ct1_enc = enc_r.enc,
                     .ek_dec = ek_dec_r.dec,
@@ -603,6 +670,7 @@ pub const StateMachine = union(StateTag) {
                     .ss = ss,
                     .full_ek = full_ek,
                     .ek_ct1_ack_received = acked,
+                    .pending_mac_ek = pending_mac_ek,
                 } };
             },
             .ct2_sending => {
@@ -622,6 +690,22 @@ pub const StateMachine = union(StateTag) {
     }
 };
 
+fn serializeMac(m: ?[32]u8, buf: *std.ArrayListUnmanaged(u8), a: mem.Allocator) !void {
+    try buf.append(a, if (m != null) 1 else 0);
+    if (m) |bytes| try buf.appendSlice(a, &bytes);
+}
+
+fn deserializeMac(data: []const u8, pos: *usize) !?[32]u8 {
+    if (pos.* + 1 > data.len) return error.TooShort;
+    const present = data[pos.*] != 0;
+    pos.* += 1;
+    if (!present) return null;
+    if (pos.* + 32 > data.len) return error.TooShort;
+    const m = data[pos.*..][0..32].*;
+    pos.* += 32;
+    return m;
+}
+
 // ---- State variant structs ----
 
 const HdrSendingState = struct {
@@ -637,6 +721,7 @@ const EkSendingState = struct {
     dk: [mlkem.DK_SIZE]u8,
     ek_enc: poly.PolyEncoder,
     ct1_dec: poly.PolyDecoder,
+    pending_mac_ct1: ?[32]u8 = null,
 };
 
 const EkSendingCt1State = struct {
@@ -644,6 +729,7 @@ const EkSendingCt1State = struct {
     dk: [mlkem.DK_SIZE]u8,
     ek_enc: poly.PolyEncoder,
     ct1: [mlkem.CT1_SIZE]u8,
+    // CT1 MAC was verified during ek_sending → ek_sending_ct1 transition.
 };
 
 const WaitingCt2State = struct {
@@ -652,10 +738,13 @@ const WaitingCt2State = struct {
     ct1: ?[mlkem.CT1_SIZE]u8,
     ct2_dec: poly.PolyDecoder,
     ct1_dec: ?poly.PolyDecoder,
+    pending_mac_ct1: ?[32]u8 = null,
+    pending_mac_ct2: ?[32]u8 = null,
 };
 
 const WaitingHdrState = struct {
     hdr_dec: poly.PolyDecoder,
+    pending_mac: ?[32]u8 = null,
 };
 
 const Ct1SendingState = struct {
@@ -665,6 +754,7 @@ const Ct1SendingState = struct {
     ss: [32]u8,
     full_ek: ?[mlkem.EK_SIZE]u8,
     ek_ct1_ack_received: bool,
+    pending_mac_ek: ?[32]u8 = null,
 };
 
 const Ct2SendingState = struct {

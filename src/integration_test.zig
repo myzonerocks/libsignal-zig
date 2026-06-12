@@ -708,3 +708,199 @@ test "group messaging" {
     defer ally.free(decrypted);
     try std.testing.expectEqualSlices(u8, "hello group!", decrypted);
 }
+
+// ---- SPQR Tests ----
+
+const spqr_state_mod = @import("spqr/state.zig");
+const spqr_msg_mod = @import("spqr/msg.zig");
+const spqr_chain_mod = @import("spqr/chain.zig");
+const spqr_auth_mod = @import("spqr/authenticator.zig");
+const spqr_poly_mod = @import("spqr/poly_codec.zig");
+const spqr_mlkem_mod = @import("spqr/mlkem768_incremental.zig");
+
+// Run one full bidirectional step of the SPQR exchange:
+//   - each side produces one chunk
+//   - each side consumes the oldest pending chunk from the other
+// Returns true once both sides have advanced to epoch >= 1.
+fn spqrStep(
+    a: mem.Allocator,
+    alice: *spqr_state_mod.SpqrState,
+    bob: *spqr_state_mod.SpqrState,
+    alice_inbox: *std.ArrayListUnmanaged([]u8),
+    bob_inbox: *std.ArrayListUnmanaged([]u8),
+) !bool {
+    {
+        const r = try spqr_state_mod.send(a, alice);
+        try bob_inbox.append(a, r.msg_bytes);
+    }
+    {
+        const r = try spqr_state_mod.send(a, bob);
+        try alice_inbox.append(a, r.msg_bytes);
+    }
+    if (bob_inbox.items.len > 0) {
+        const msg = bob_inbox.orderedRemove(0);
+        _ = try spqr_state_mod.recv(a, bob, msg);
+    }
+    if (alice_inbox.items.len > 0) {
+        const msg = alice_inbox.orderedRemove(0);
+        _ = try spqr_state_mod.recv(a, alice, msg);
+    }
+    return alice.chain.current_epoch >= 1 and bob.chain.current_epoch >= 1;
+}
+
+test "SPQR: epoch advancement and chain key symmetry" {
+    // Drive a full ML-KEM-768 epoch exchange and verify:
+    //   (1) both sides advance to epoch 1,
+    //   (2) send-chain key produced by the new epoch sender equals
+    //       the recv-chain key produced by the new epoch receiver.
+    var arena = std.heap.ArenaAllocator.init(ally);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var initial_key: [32]u8 = undefined;
+    rnd.bytes(&initial_key);
+
+    var alice = spqr_state_mod.SpqrState{
+        .chain = try spqr_chain_mod.Chain.init(a, initial_key, .a2b),
+        .auth = spqr_auth_mod.Authenticator.init(initial_key, 0),
+        .sm = .unsampled,
+    };
+    var bob = spqr_state_mod.SpqrState{
+        .chain = try spqr_chain_mod.Chain.init(a, initial_key, .b2a),
+        .auth = spqr_auth_mod.Authenticator.init(initial_key, 0),
+        .sm = .{ .waiting_hdr = .{
+            .hdr_dec = try spqr_poly_mod.PolyDecoder.init(spqr_mlkem_mod.HEADER_SIZE),
+        } },
+    };
+
+    var alice_inbox: std.ArrayListUnmanaged([]u8) = .empty;
+    var bob_inbox: std.ArrayListUnmanaged([]u8) = .empty;
+
+    // Drive the exchange. The exchange needs ~72 minimum chunks each way;
+    // 400 iterations with the round-robin delivery policy is more than enough.
+    for (0..400) |_| {
+        if (try spqrStep(a, &alice, &bob, &alice_inbox, &bob_inbox)) break;
+    }
+
+    try std.testing.expect(alice.chain.current_epoch >= 1);
+    try std.testing.expect(bob.chain.current_epoch >= 1);
+    try std.testing.expectEqual(alice.chain.current_epoch, bob.chain.current_epoch);
+
+    // After epoch 0 exchange: Alice is now waiting_hdr (receiver), Bob is unsampled (sender).
+    // Drain any in-flight messages so state machines are idle.
+    for (0..400) |_| {
+        if (try spqrStep(a, &alice, &bob, &alice_inbox, &bob_inbox)) break;
+    }
+
+    // Bob now sends in epoch 1. Capture his send chain key.
+    const b_send = try spqr_state_mod.send(a, &bob);
+    const parsed = try spqr_msg_mod.parse(b_send.msg_bytes);
+
+    // Alice receives that exact message. Her recv chain key must match Bob's send chain key.
+    const a_recv = try spqr_state_mod.recv(a, &alice, b_send.msg_bytes);
+
+    // Both sides must produce a non-null key for the epoch-1 message.
+    const key_bob = b_send.chain_key orelse return error.NullSendKey;
+    const key_alice = a_recv.chain_key orelse return error.NullRecvKey;
+    _ = parsed;
+    try std.testing.expectEqualSlices(u8, &key_bob, &key_alice);
+}
+
+test "SPQR: state serialization round-trip" {
+    // Serialize SpqrState mid-exchange, deserialize, and verify the exchange
+    // still completes correctly from the restored state.
+    var arena = std.heap.ArenaAllocator.init(ally);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var initial_key: [32]u8 = undefined;
+    rnd.bytes(&initial_key);
+
+    var alice = spqr_state_mod.SpqrState{
+        .chain = try spqr_chain_mod.Chain.init(a, initial_key, .a2b),
+        .auth = spqr_auth_mod.Authenticator.init(initial_key, 0),
+        .sm = .unsampled,
+    };
+    var bob = spqr_state_mod.SpqrState{
+        .chain = try spqr_chain_mod.Chain.init(a, initial_key, .b2a),
+        .auth = spqr_auth_mod.Authenticator.init(initial_key, 0),
+        .sm = .{ .waiting_hdr = .{
+            .hdr_dec = try spqr_poly_mod.PolyDecoder.init(spqr_mlkem_mod.HEADER_SIZE),
+        } },
+    };
+
+    var alice_inbox: std.ArrayListUnmanaged([]u8) = .empty;
+    var bob_inbox: std.ArrayListUnmanaged([]u8) = .empty;
+
+    // Advance Alice far enough to be mid-EK-sending (after HDR is fully sent, ~4 steps).
+    for (0..4) |_| {
+        _ = try spqrStep(a, &alice, &bob, &alice_inbox, &bob_inbox);
+    }
+
+    // Snapshot Alice's state via serialize → deserialize round-trip.
+    const snapshot = try alice.serialize(a);
+    var alice_restored = try spqr_state_mod.SpqrState.deserialize(a, snapshot);
+
+    // Re-serialize the restored state and confirm it is byte-for-byte identical.
+    const snapshot2 = try alice_restored.serialize(a);
+    try std.testing.expectEqualSlices(u8, snapshot, snapshot2);
+
+    // Continue the exchange from the restored Alice until epoch 1 is reached.
+    for (0..400) |_| {
+        if (try spqrStep(a, &alice_restored, &bob, &alice_inbox, &bob_inbox)) break;
+    }
+
+    try std.testing.expect(alice_restored.chain.current_epoch >= 1);
+    try std.testing.expect(bob.chain.current_epoch >= 1);
+}
+
+test "SPQR: MAC rejection on tampered header" {
+    // Verify that a receiver detects a forged or corrupted MAC and returns InvalidMac.
+    // Alice sends two HDR chunks (the minimum needed for the 64-byte header).
+    // We corrupt the MAC carried in chunk 0; the error fires when chunk 1 completes
+    // the header and MAC verification runs.
+    var arena = std.heap.ArenaAllocator.init(ally);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var initial_key: [32]u8 = undefined;
+    rnd.bytes(&initial_key);
+
+    var alice = spqr_state_mod.SpqrState{
+        .chain = try spqr_chain_mod.Chain.init(a, initial_key, .a2b),
+        .auth = spqr_auth_mod.Authenticator.init(initial_key, 0),
+        .sm = .unsampled,
+    };
+    var bob = spqr_state_mod.SpqrState{
+        .chain = try spqr_chain_mod.Chain.init(a, initial_key, .b2a),
+        .auth = spqr_auth_mod.Authenticator.init(initial_key, 0),
+        .sm = .{ .waiting_hdr = .{
+            .hdr_dec = try spqr_poly_mod.PolyDecoder.init(spqr_mlkem_mod.HEADER_SIZE),
+        } },
+    };
+
+    // HDR has 64 bytes → 2 chunks of 32 bytes each.
+    // Chunk 0 carries the MAC; chunk 1 completes the header and triggers verification.
+
+    // Alice sends HDR chunk 0 (carries MAC).
+    const chunk0_send = try spqr_state_mod.send(a, &alice);
+    var msg0 = try spqr_msg_mod.parse(chunk0_send.msg_bytes);
+    try std.testing.expect(msg0.mac != null); // chunk 0 must have a MAC
+
+    // Corrupt the MAC.
+    msg0.mac.?[0] ^= 0xFF;
+    const tampered0 = try spqr_msg_mod.serialize(a, msg0);
+
+    // Deliver tampered chunk 0 to Bob. Bob stores the (bad) MAC; no verification yet.
+    _ = try spqr_state_mod.recv(a, &bob, tampered0);
+
+    // Alice sends HDR chunk 1 (no MAC).
+    const chunk1_send = try spqr_state_mod.send(a, &alice);
+    try std.testing.expect((try spqr_msg_mod.parse(chunk1_send.msg_bytes)).mac == null);
+
+    // Deliver chunk 1 to Bob. Header is now complete → MAC verification fires → InvalidMac.
+    try std.testing.expectError(
+        error.InvalidMac,
+        spqr_state_mod.recv(a, &bob, chunk1_send.msg_bytes),
+    );
+}
