@@ -1,4 +1,4 @@
-// Alice (initiator) X3DH / PQXDH parameters for session establishment.
+// Alice (initiator) PQXDH key agreement parameters for session establishment.
 const std = @import("std");
 const curve = @import("../curve.zig");
 const identity = @import("../identity.zig");
@@ -20,6 +20,7 @@ pub const AliceSignalProtocolParameters = struct {
 pub const DerivedKeys = struct {
     root_key: RootKey,
     chain_key: ChainKey,
+    pqr_key: ?[32]u8, // present for PQXDH, null for X3DH
     kyber_ciphertext: ?[]u8, // if PQXDH was used; caller must free
 };
 
@@ -76,6 +77,7 @@ pub fn initialize(
     return .{
         .root_key = RootKey.init(derived.root_key),
         .chain_key = ChainKey.init(derived.chain_key, 0),
+        .pqr_key = derived.pqr_key,
         .kyber_ciphertext = kyber_ct_buf,
     };
 }

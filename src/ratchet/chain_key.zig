@@ -11,9 +11,9 @@ pub const ChainKey = struct {
         return .{ .key = key, .index = index };
     }
 
-    pub fn messageKeys(self: ChainKey) MessageKeys {
+    pub fn messageKeys(self: ChainKey, pqr_key: ?[32]u8) MessageKeys {
         const seed = kdf.messageKeySeed(self.key);
-        return MessageKeys.fromSeed(seed, self.index);
+        return MessageKeys.fromSeed(seed, self.index, pqr_key);
     }
 
     pub fn advance(self: ChainKey) ChainKey {

@@ -14,6 +14,7 @@ const signal_msg_mod = @import("messages/signal_message.zig");
 const pksm_mod = @import("messages/pre_key_signal_message.zig");
 const err = @import("error.zig");
 const aes_cbc = @import("session_builder.zig").aes_cbc;
+const spqr = @import("spqr.zig");
 const mem = std.mem;
 
 pub const CiphertextType = enum(u8) {
@@ -71,8 +72,14 @@ pub const SessionCipher = struct {
         const state = record.currentState() orelse return err.SignalError.InvalidSession;
         const our_identity = try self.identity_store.getIdentityKeyPair();
 
-        // Get message keys from sender chain
-        const message_keys = state.sender_chain_key.messageKeys();
+        // SPQR send: produce next chunk and advance chain.
+        const pqr_send = try spqr.send(self.allocator, if (state.pq_ratchet_state.len > 0) state.pq_ratchet_state else null);
+        if (state.pq_ratchet_state.len > 0) self.allocator.free(state.pq_ratchet_state);
+        state.pq_ratchet_state = pqr_send.state;
+        defer self.allocator.free(pqr_send.msg);
+
+        // Get message keys from sender chain, mixing in SPQR key.
+        const message_keys = state.sender_chain_key.messageKeys(pqr_send.key);
         state.sender_chain_key = state.sender_chain_key.advance();
 
         // Encrypt plaintext
@@ -87,15 +94,18 @@ pub const SessionCipher = struct {
         const sender_id_bytes = our_identity.identity_key.serialize();
         const receiver_id_bytes = state.remote_identity_key.serialize();
 
+        const pqr_msg: ?[]const u8 = if (pqr_send.msg.len > 0) pqr_send.msg else null;
+
         // Check if we need to send a PreKeySignalMessage
         if (state.pending_pre_key) |ppk| {
-            // Build PreKeySignalMessage
+            const msg_version: u8 = @intCast(state.session_version);
             const signal_msg = signal_msg_mod.SignalMessage{
+                .message_version = msg_version,
                 .ratchet_key = state.sender_ratchet_key_pair.public_key,
                 .counter = message_keys.counter,
                 .previous_counter = state.previous_counter,
                 .ciphertext = ciphertext,
-                .pq_ratchet = null,
+                .pq_ratchet = pqr_msg,
                 .allocator = self.allocator,
             };
             const signal_bytes = try signal_msg.serialize(
@@ -106,7 +116,7 @@ pub const SessionCipher = struct {
             defer self.allocator.free(signal_bytes);
 
             var pksm = pksm_mod.PreKeySignalMessage{
-                .message_version = 3,
+                .message_version = msg_version,
                 .registration_id = state.local_registration_id,
                 .pre_key_id = ppk.pre_key_id,
                 .signed_pre_key_id = ppk.signed_pre_key_id,
@@ -129,12 +139,14 @@ pub const SessionCipher = struct {
         }
 
         // Regular SignalMessage
+        const msg_version: u8 = @intCast(state.session_version);
         const signal_msg = signal_msg_mod.SignalMessage{
+            .message_version = msg_version,
             .ratchet_key = state.sender_ratchet_key_pair.public_key,
             .counter = message_keys.counter,
             .previous_counter = state.previous_counter,
             .ciphertext = ciphertext,
-            .pq_ratchet = null,
+            .pq_ratchet = pqr_msg,
             .allocator = self.allocator,
         };
         const serialized = try signal_msg.serialize(
@@ -252,28 +264,26 @@ pub const SessionCipher = struct {
         var new_state_owned = true; // cleared after ownership transfers to record
         defer if (new_state_owned) new_state.deinit();
 
-        new_state.session_version = 3;
+        new_state.session_version = if (derived.pqr_key != null) 4 else 3;
         new_state.local_identity_key = .{ .public_key = our_identity.identity_key.public_key };
         new_state.remote_identity_key = their_identity_key;
-        new_state.root_key = derived.root_key;
         new_state.remote_registration_id = pksm.registration_id;
         new_state.local_registration_id = try self.identity_store.getLocalRegistrationId();
         new_state.alice_base_key = alice_base_key_serialized;
 
-        // Bob's receiver chain: keyed to Alice's base key with the X3DH chain key.
-        // This matches Alice's initial sender chain (derived.chain_key).
-        try new_state.addReceiverChain(pksm.base_key, derived.chain_key);
+        // Bob sets root_key = X3DH root_key, sender_chain = X3DH chain_key,
+        // sender ratchet key = signed pre-key. No initial receiver chain —
+        // Bob derives one lazily via a DH ratchet step on Alice's first message.
+        new_state.root_key = derived.root_key;
+        new_state.sender_chain_key = derived.chain_key;
+        new_state.sender_ratchet_key_pair = our_signed_pre_key.key_pair;
 
-        // Bob advances the root key with a fresh sender ratchet key pair.
-        // DH(Bob's_new_key, Alice's_base) + old_RK → new_RK, Bob's sender chain.
-        const bob_sender_kp = try curve.KeyPair.generate();
-        const bob_send_ratchet = try derived.root_key.createChain(
-            pksm.base_key,
-            bob_sender_kp.private_key,
-        );
-        new_state.root_key = bob_send_ratchet.root_key;
-        new_state.sender_chain_key = bob_send_ratchet.chain_key;
-        new_state.sender_ratchet_key_pair = bob_sender_kp;
+        // SPQR: Bob (B2A) waits for header/EK to encapsulate.
+        if (derived.pqr_key) |pqrk| {
+            const pqr_state = try spqr.initialState(self.allocator, pqrk, .b2a);
+            if (new_state.pq_ratchet_state.len > 0) self.allocator.free(new_state.pq_ratchet_state);
+            new_state.pq_ratchet_state = pqr_state;
+        }
 
         _ = try self.identity_store.saveIdentity(&self.remote_address, their_identity_key);
         if (pksm.pre_key_id) |pkid| {
@@ -321,12 +331,13 @@ fn decryptWhisperMessage(
     const mac_received = data[mac_start..][0..signal_msg_mod.MAC_LENGTH];
     const body = data[1..mac_start];
 
-    // Parse to get ratchet key and counter
+    // Parse to get ratchet key, counter, and pq_ratchet bytes
     const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
     var pos: usize = 0;
     var rk_bytes: ?[]const u8 = null;
     var counter: u32 = 0;
     var ciphertext_raw: ?[]const u8 = null;
+    var pq_ratchet_raw: ?[]const u8 = null;
 
     while (try @import("proto.zig").nextField(body, &pos)) |field| {
         switch (field.number) {
@@ -339,6 +350,9 @@ fn decryptWhisperMessage(
             4 => {
                 if (field.wire_type == .len) ciphertext_raw = field.data.len;
             },
+            5 => {
+                if (field.wire_type == .len) pq_ratchet_raw = field.data.len;
+            },
             else => {},
         }
     }
@@ -346,8 +360,13 @@ fn decryptWhisperMessage(
     const ratchet_key = try curve.PublicKey.deserialize(rk_bytes orelse return err.SignalError.InvalidMessage);
     const ciphertext = ciphertext_raw orelse return err.SignalError.InvalidMessage;
 
+    // SPQR recv: process incoming V1Msg chunk and advance chain.
+    const pqr_recv = try spqr.recv(allocator, if (state.pq_ratchet_state.len > 0) state.pq_ratchet_state else null, pq_ratchet_raw);
+    if (state.pq_ratchet_state.len > 0) allocator.free(state.pq_ratchet_state);
+    state.pq_ratchet_state = pqr_recv.state;
+
     // Get or compute message keys — perform DH ratchet if needed
-    const message_keys = try getMessageKeys(allocator, state, ratchet_key, counter);
+    const message_keys = try getMessageKeys(allocator, state, ratchet_key, counter, pqr_recv.key);
 
     // Verify MAC
     var mac_engine = HmacSha256.init(&message_keys.mac_key);
@@ -370,41 +389,41 @@ fn getMessageKeys(
     state: *SessionState,
     their_ephemeral: curve.PublicKey,
     counter: u32,
+    pqr_key: ?[32]u8,
 ) !@import("ratchet/message_keys.zig").MessageKeys {
-    // If we have this chain, get keys from it
-    if (try state.getOrComputeMessageKeys(their_ephemeral, counter)) |mk| {
+    _ = allocator;
+
+    // If we have this receiver chain, get keys from it
+    if (try state.getOrComputeMessageKeys(their_ephemeral, counter, pqr_key)) |mk| {
         return mk;
     }
 
-    // Need to perform a DH ratchet step
-    const previous_counter = state.sender_chain_key.index;
+    // DH ratchet step: no receiver chain for their_ephemeral yet.
+    // previous_counter = last index used in current sender chain (saturating_sub(1)).
+    state.previous_counter = if (state.sender_chain_key.index > 0)
+        state.sender_chain_key.index - 1
+    else
+        0;
 
-    // Save current sender chain skipped messages
-    // (before advancing, mark position)
-    state.previous_counter = previous_counter;
-
-    // Compute new ratchet
+    // Receiving half-step: derive new root_key + receiver chain_key.
     const recv_ratchet = try state.root_key.createChain(
         their_ephemeral,
         state.sender_ratchet_key_pair.private_key,
     );
     state.root_key = recv_ratchet.root_key;
-
     try state.addReceiverChain(their_ephemeral, recv_ratchet.chain_key);
 
-    // Generate new sender ratchet
-    const new_sender_ratchet_kp = try curve.KeyPair.generate();
+    // Sending half-step: generate fresh sender ratchet key and derive new sender chain.
+    const new_sender_kp = try curve.KeyPair.generate();
     const send_ratchet = try state.root_key.createChain(
         their_ephemeral,
-        new_sender_ratchet_kp.private_key,
+        new_sender_kp.private_key,
     );
     state.root_key = send_ratchet.root_key;
     state.sender_chain_key = send_ratchet.chain_key;
-    state.sender_ratchet_key_pair = new_sender_ratchet_kp;
-
-    _ = allocator;
+    state.sender_ratchet_key_pair = new_sender_kp;
 
     // Now get the message keys from the new receiver chain
-    const mk = try state.getOrComputeMessageKeys(their_ephemeral, counter);
+    const mk = try state.getOrComputeMessageKeys(their_ephemeral, counter, pqr_key);
     return mk orelse err.SignalError.InvalidMessage;
 }

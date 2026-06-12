@@ -33,24 +33,39 @@ pub fn createChain(
 pub fn createSessionKeys(
     input_key_material: []const u8,
     pqxdh: bool,
-) struct { root_key: [32]u8, chain_key: [32]u8 } {
+) struct { root_key: [32]u8, chain_key: [32]u8, pqr_key: ?[32]u8 } {
     const label = if (pqxdh)
         "WhisperText_X25519_SHA-256_CRYSTALS-KYBER-1024"
     else
         "WhisperText";
     const prk = HkdfSha256.extract(&ZERO_SALT, input_key_material);
-    var out: [64]u8 = undefined;
-    HkdfSha256.expand(&out, label, prk);
-    return .{
-        .root_key = out[0..32].*,
-        .chain_key = out[32..64].*,
-    };
+    if (pqxdh) {
+        var out: [96]u8 = undefined;
+        HkdfSha256.expand(&out, label, prk);
+        return .{
+            .root_key = out[0..32].*,
+            .chain_key = out[32..64].*,
+            .pqr_key = out[64..96].*,
+        };
+    } else {
+        var out: [64]u8 = undefined;
+        HkdfSha256.expand(&out, label, prk);
+        return .{
+            .root_key = out[0..32].*,
+            .chain_key = out[32..64].*,
+            .pqr_key = null,
+        };
+    }
 }
 
 pub fn deriveMessageKeys(
     chain_key_seed: [32]u8,
+    pqr_key: ?[32]u8,
 ) struct { cipher_key: [32]u8, mac_key: [32]u8, iv: [16]u8 } {
-    const prk = HkdfSha256.extract(&ZERO_SALT, &chain_key_seed);
+    // When pqr_key is present (SPQR active), it is used as the HKDF salt.
+    // When absent (SPQR disabled / V0), fall back to zero-salt (RFC 5869 default).
+    const salt: []const u8 = if (pqr_key) |k| &k else &ZERO_SALT;
+    const prk = HkdfSha256.extract(salt, &chain_key_seed);
     var out: [80]u8 = undefined;
     HkdfSha256.expand(&out, "WhisperMessageKeys", prk);
     return .{

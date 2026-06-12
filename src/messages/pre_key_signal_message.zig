@@ -6,8 +6,8 @@ const proto = @import("../proto.zig");
 const err = @import("../error.zig");
 const mem = std.mem;
 
-pub const MESSAGE_VERSION: u8 = 3;
-pub const VERSION_BYTE: u8 = (MESSAGE_VERSION << 4) | MESSAGE_VERSION;
+pub const CURRENT_VERSION: u8 = 4;
+pub const PRE_KYBER_VERSION: u8 = 3; // X3DH only, no longer accepted for new sessions
 
 pub const PreKeySignalMessage = struct {
     message_version: u8,
@@ -46,7 +46,8 @@ pub const PreKeySignalMessage = struct {
         defer allocator.free(body);
 
         const out = try allocator.alloc(u8, 1 + body.len);
-        out[0] = VERSION_BYTE;
+        // High nibble = session version, low nibble = current wire version.
+        out[0] = ((self.message_version & 0xF) << 4) | CURRENT_VERSION;
         @memcpy(out[1..], body);
         return out;
     }
@@ -57,7 +58,6 @@ pub const PreKeySignalMessage = struct {
         const version_byte = data[0];
         const message_version = version_byte >> 4;
         if (message_version < 3) return err.SignalError.LegacyCiphertextVersion;
-        if (message_version > MESSAGE_VERSION) return err.SignalError.UnknownCiphertextVersion;
 
         const body = data[1..];
         var pos: usize = 0;

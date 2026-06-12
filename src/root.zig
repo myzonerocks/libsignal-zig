@@ -1,4 +1,3 @@
-// libsignal-zig: Pure Zig implementation of the Signal Protocol.
 pub const err = @import("error.zig");
 pub const random = @import("random.zig");
 pub const kdf = @import("kdf.zig");

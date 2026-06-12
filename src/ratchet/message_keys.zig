@@ -7,8 +7,8 @@ pub const MessageKeys = struct {
     iv: [16]u8,
     counter: u32,
 
-    pub fn fromSeed(seed: [32]u8, counter: u32) MessageKeys {
-        const derived = kdf.deriveMessageKeys(seed);
+    pub fn fromSeed(seed: [32]u8, counter: u32, pqr_key: ?[32]u8) MessageKeys {
+        const derived = kdf.deriveMessageKeys(seed, pqr_key);
         return .{
             .cipher_key = derived.cipher_key,
             .mac_key = derived.mac_key,

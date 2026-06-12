@@ -1,4 +1,4 @@
-// Bob (responder) X3DH / PQXDH key agreement parameters.
+// Bob (responder) PQXDH key agreement parameters.
 const std = @import("std");
 const curve = @import("../curve.zig");
 const identity = @import("../identity.zig");
@@ -21,6 +21,7 @@ pub const BobSignalProtocolParameters = struct {
 pub const DerivedKeys = struct {
     root_key: RootKey,
     chain_key: ChainKey,
+    pqr_key: ?[32]u8, // present for PQXDH, null for X3DH
 };
 
 /// Perform X3DH/PQXDH key agreement from Bob's perspective.
@@ -73,5 +74,6 @@ pub fn initialize(
     return .{
         .root_key = RootKey.init(derived.root_key),
         .chain_key = ChainKey.init(derived.chain_key, 0),
+        .pqr_key = derived.pqr_key,
     };
 }

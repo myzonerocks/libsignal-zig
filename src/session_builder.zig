@@ -9,6 +9,7 @@ const SessionRecord = @import("state/session_record.zig").SessionRecord;
 const SessionState = @import("state/session_state.zig").SessionState;
 const alice_ratchet = @import("ratchet/alice.zig");
 const bob_ratchet = @import("ratchet/bob.zig");
+const spqr = @import("spqr.zig");
 const rnd = @import("random.zig");
 const err = @import("error.zig");
 const mem = std.mem;
@@ -87,20 +88,36 @@ pub const SessionBuilder = struct {
         var session_state = try SessionState.init(self.allocator);
         errdefer session_state.deinit();
 
-        session_state.session_version = 3;
+        session_state.session_version = if (derived.pqr_key != null) 4 else 3;
         session_state.remote_identity_key = their_identity_key;
         session_state.local_identity_key = .{ .public_key = our_identity_key_pair.identity_key.public_key };
-        session_state.root_key = derived.root_key;
         session_state.remote_registration_id = bundle.registration_id;
         session_state.local_registration_id = try self.identity_store.getLocalRegistrationId();
 
-        // Alice's initial sender chain is the X3DH-derived chain key.
-        // Alice's base key is her initial ratchet key — Bob stores the matching
-        // receiver chain keyed to this base key after the X3DH handshake.
-        session_state.sender_chain_key = derived.chain_key;
-        session_state.sender_ratchet_key_pair = our_base_key;
+        // Session init:
+        // 1. Generate a fresh sender ratchet key (distinct from our_base_key).
+        // 2. Perform a DH ratchet step to derive the initial sender chain.
+        // 3. Add a receiver chain keyed to their_ratchet_key with the X3DH chain_key.
+        const sending_ratchet_key = try curve.KeyPair.generate();
+        const send_ratchet = try derived.root_key.createChain(
+            bundle.signed_pre_key_public, // their_ratchet_key
+            sending_ratchet_key.private_key,
+        );
+        session_state.root_key = send_ratchet.root_key;
+        session_state.sender_chain_key = send_ratchet.chain_key;
+        session_state.sender_ratchet_key_pair = sending_ratchet_key;
 
-        // Store pending pre-key info
+        // Receiver chain for Bob's initial sender (Bob's SPK = their_ratchet_key).
+        try session_state.addReceiverChain(bundle.signed_pre_key_public, derived.chain_key);
+
+        // SPQR: Alice (A2B) generates ML-KEM keys and sends header+EK.
+        if (derived.pqr_key) |pqrk| {
+            const pqr_state = try spqr.initialState(self.allocator, pqrk, .a2b);
+            if (session_state.pq_ratchet_state.len > 0) self.allocator.free(session_state.pq_ratchet_state);
+            session_state.pq_ratchet_state = pqr_state;
+        }
+
+        // Store pending pre-key info (carried in the first PreKeySignalMessage).
         const alice_base_key_serialized = our_base_key.public_key.serialize();
         session_state.alice_base_key = alice_base_key_serialized;
         session_state.pending_pre_key = .{

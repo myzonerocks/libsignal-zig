@@ -387,3 +387,6 @@ const sf_bytes = try sf.serialize();
 defer allocator.free(sf_bytes);
 const matches = try sf.compareTo(their_sf_bytes);
 ```
+
+---
+MIT

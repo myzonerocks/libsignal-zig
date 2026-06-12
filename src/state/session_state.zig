@@ -1,4 +1,3 @@
-// SessionState: the full Double Ratchet session state.
 // Serializes to/from protobuf SessionStructure.
 const std = @import("std");
 const curve = @import("../curve.zig");
@@ -10,9 +9,10 @@ const ratchet_chain = @import("../ratchet/chain_key.zig");
 const ratchet_msg = @import("../ratchet/message_keys.zig");
 const mem = std.mem;
 
-pub const MAX_SKIPPED_MESSAGES: usize = 2000;
+pub const MAX_FORWARD_JUMPS: usize = 25_000;
+pub const MAX_MESSAGE_KEYS: usize = 2000;
 pub const MAX_RECEIVER_CHAINS: usize = 5;
-pub const SESSION_VERSION: u32 = 3;
+pub const SESSION_VERSION: u32 = 4;
 
 pub const SkippedMessageKey = struct {
     ratchet_key: [curve.PUBLIC_KEY_LENGTH]u8,
@@ -78,6 +78,8 @@ pub const SessionState = struct {
 
     alice_base_key: ?[curve.SERIALIZED_PUBLIC_KEY_LENGTH]u8,
 
+    pq_ratchet_state: []u8, // SPQR serialized state; empty = V0 (no-op)
+
     allocator: mem.Allocator,
 
     pub fn init(allocator: mem.Allocator) !SessionState {
@@ -97,6 +99,7 @@ pub const SessionState = struct {
             .remote_registration_id = 0,
             .local_registration_id = 0,
             .alice_base_key = null,
+            .pq_ratchet_state = &[_]u8{},
             .allocator = allocator,
         };
     }
@@ -106,6 +109,9 @@ pub const SessionState = struct {
         self.receiver_chains.deinit(self.allocator);
         if (self.pending_kyber_pre_key) |*pkpk| {
             self.allocator.free(pkpk.ciphertext);
+        }
+        if (self.pq_ratchet_state.len > 0) {
+            self.allocator.free(self.pq_ratchet_state);
         }
     }
 
@@ -143,9 +149,9 @@ pub const SessionState = struct {
         chain_key: ratchet_chain.ChainKey,
     ) !void {
         const rc = ReceiverChain.init(self.allocator, ratchet_key, chain_key);
-        try self.receiver_chains.insert(self.allocator, 0, rc);
+        try self.receiver_chains.append(self.allocator, rc);
         if (self.receiver_chains.items.len > MAX_RECEIVER_CHAINS) {
-            var old = self.receiver_chains.pop().?;
+            var old = self.receiver_chains.orderedRemove(0);
             old.deinit();
         }
     }
@@ -165,10 +171,11 @@ pub const SessionState = struct {
         self: *SessionState,
         ratchet_key: curve.PublicKey,
         counter: u32,
+        pqr_key: ?[32]u8,
     ) !?ratchet_msg.MessageKeys {
         const rc = self.findReceiverChain(ratchet_key) orelse return null;
 
-        // Check skipped cache first
+        // Check skipped cache first (pre-computed without SPQR key)
         for (rc.message_keys.items, 0..) |mk, i| {
             if (mk.counter == counter and
                 std.mem.eql(u8, &mk.ratchet_key, &ratchet_key.key_bytes))
@@ -181,22 +188,25 @@ pub const SessionState = struct {
 
         if (rc.chain_key.index > counter) return err.SignalError.DuplicateMessage;
 
-        if (counter - rc.chain_key.index > MAX_SKIPPED_MESSAGES) {
+        if (counter - rc.chain_key.index > MAX_FORWARD_JUMPS) {
             return err.SignalError.InvalidMessage;
         }
 
-        // Advance chain key, caching skipped message keys
+        // Advance chain key, caching skipped message keys (null pqr_key for cache)
         while (rc.chain_key.index < counter) {
-            const mk = rc.chain_key.messageKeys();
+            const mk = rc.chain_key.messageKeys(null);
             try rc.message_keys.append(rc.allocator, .{
                 .ratchet_key = ratchet_key.key_bytes,
                 .counter = rc.chain_key.index,
                 .keys = mk,
             });
+            if (rc.message_keys.items.len > MAX_MESSAGE_KEYS) {
+                _ = rc.message_keys.orderedRemove(0);
+            }
             rc.chain_key = rc.chain_key.advance();
         }
 
-        const result = rc.chain_key.messageKeys();
+        const result = rc.chain_key.messageKeys(pqr_key);
         rc.chain_key = rc.chain_key.advance();
         return result;
     }
@@ -278,6 +288,10 @@ pub const SessionState = struct {
             try enc.writeBytesField(13, &abk);
         }
 
+        if (self.pq_ratchet_state.len > 0) {
+            try enc.writeBytesField(15, self.pq_ratchet_state);
+        }
+
         if (self.pending_kyber_pre_key) |pkpk| {
             var kpk_enc = proto.Encoder.init(allocator);
             defer kpk_enc.deinit();
@@ -328,6 +342,10 @@ pub const SessionState = struct {
                     ss.alice_base_key = field.data.len[0..curve.SERIALIZED_PUBLIC_KEY_LENGTH].*;
                 },
                 14 => if (field.wire_type == .len) try parsePendingKyberPreKey(&ss, allocator, field.data.len),
+                15 => if (field.wire_type == .len) {
+                    if (ss.pq_ratchet_state.len > 0) allocator.free(ss.pq_ratchet_state);
+                    ss.pq_ratchet_state = try allocator.dupe(u8, field.data.len);
+                },
                 else => {},
             }
         }
