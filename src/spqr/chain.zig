@@ -162,11 +162,9 @@ pub const Chain = struct {
         const num_links = std.mem.readInt(u32, data[pos..][0..4], .big);
         pos += 4;
         var links: std.ArrayListUnmanaged(Epoch) = .empty;
+        errdefer links.deinit(allocator);
         for (0..num_links) |_| {
-            if (pos + 4 + 32 + 4 + 32 > data.len) {
-                links.deinit(allocator);
-                return error.TooShort;
-            }
+            if (pos + 4 + 32 + 4 + 32 > data.len) return error.TooShort;
             const send_ctr = std.mem.readInt(u32, data[pos..][0..4], .big);
             pos += 4;
             const send_next = data[pos..][0..32].*;
