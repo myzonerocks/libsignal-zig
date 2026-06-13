@@ -3,13 +3,19 @@
 libsignal-zig is a Zig implementation of the Signal Protocol. It exports a C-compatible API, which makes it usable from any language that can communicate with C APIs: Go, Swift, Rust, Python, Ruby, and others.
 
 **Zig version**: 0.16.0
-**Status**: All core protocol operations are implemented and battle-tested end-to-end via a Go CGo test suite ([`proc/`](proc/)). Suitable for production use in projects that need Signal Protocol primitives without pulling in the official Rust/Java libsignal.
+
+**Status**: Implemented. End-to-end coverage across multiple languages in [`examples/`](examples/).
 
 ## Why?
 
-The official Signal client library ([libsignal](https://github.com/signalapp/libsignal)) is written in Rust. It is large, has a significant build toolchain, and its C API surface is tied to the Rust ecosystem.
+[libsignal](https://github.com/signalapp/libsignal) is a complete, production-proven implementation. If you are building a Signal client and already have a Rust toolchain, use it.
 
-libsignal-zig is a clean-room Zig implementation. It has zero runtime dependencies beyond the OS, cross-compiles to any target Zig supports, and builds with a single `zig build`. If you are building in Zig or want a portable, auditable Signal Protocol library without a Rust toolchain, this is that option.
+libsignal-zig exists for a different set of constraints:
+
+- **No Rust toolchain.** `zig build` is the only build step. No cargo, no rustup, no cross-compilation wrappers.
+- **Cross-compilation is first-class.** Zig targets any supported platform from any host in a single command, with no additional toolchain configuration.
+- **Native Zig integration.** Add it as a standard `b.dependency()` — no FFI boundary, no generated bindings, no cgo.
+- **Auditable.** The entire implementation is pure Zig against the standard library. No vendored crates, no generated code.
 
 ## What's implemented
 
@@ -27,17 +33,15 @@ libsignal-zig is a clean-room Zig implementation. It has zero runtime dependenci
 
 ## Build
 
-```sh
-zig build                           # debug
-```
-
-Or a more optimized one
-
-```sh
-zig build -Doptimize=ReleaseFast     # optimized
-```
-
 Pick one.
+
+```sh
+zig build                         # debug
+```
+
+```sh
+zig build -Doptimize=ReleaseFast  # optimized
+```
 
 Build outputs:
 
@@ -132,25 +136,26 @@ defer allocator.free(plaintext);
 
 ## Installation (Zig)
 
-Find the commit SHA you want to pin on GitHub (e.g. `a1b2c3d`), then run:
+**From a tag** — no SHA needed, just the tag name:
 
 ```sh
-zig fetch --save https://github.com/myzonerocks/libsignal-zig/archive/a1b2c3d.tar.gz
+zig fetch --save https://github.com/myzonerocks/libsignal-zig/archive/refs/tags/v1.0.0.tar.gz
 ```
 
-`zig fetch` downloads the archive, computes the content hash, and writes both into `build.zig.zon` automatically. The result looks like:
+`zig fetch` downloads the archive, computes the content hash, and writes both fields into `build.zig.zon` automatically.
+
+**From a local checkout** — no fetch at all, just point at the path:
 
 ```zig
 // build.zig.zon
 .dependencies = .{
     .libsignal_zig = .{
-        .url = "https://github.com/myzonerocks/libsignal-zig/archive/a1b2c3d.tar.gz",
-        .hash = "122099f7d5b02e2ee5c38b0a55a85c1b3f99db80e7e9c3e1c2e2b0e9b5d4a1f3c8",
+        .path = "../libsignal-zig",
     },
 },
 ```
 
-Then wire it up in `build.zig`:
+Either way, wire it up in `build.zig` the same:
 
 ```zig
 const libsignal = b.dependency("libsignal_zig", .{ .target = target, .optimize = optimize });
@@ -179,11 +184,7 @@ The Zig API is documented in source comments. Entry points worth reading:
 zig test src/integration_test.zig
 ```
 
-```sh
-# Go CGo battle-test — links against the compiled .dylib and exercises every 
-# exported C function with real encrypt/decrypt roundtrips.
-cd proc && go run .
-```
+[`examples/`](examples/) contains end-to-end test suites for C, C++, Go, Java, Ruby, Rust, and Zig, each exercising every protocol operation. See [`examples/README.md`](examples/README.md) for prerequisites and run instructions per language.
 
 ## Memory contract
 

@@ -1,0 +1,11 @@
+[package]
+name = "libsignal-example"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "libsignal-example"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"

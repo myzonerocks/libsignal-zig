@@ -1,0 +1,16 @@
+.{
+    .name = .proc_zig,
+    .version = "0.0.0",
+    .fingerprint = 0x3854e98e6d4d1298,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .libsignal_zig = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

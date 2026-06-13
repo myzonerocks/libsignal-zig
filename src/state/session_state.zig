@@ -83,16 +83,16 @@ pub const SessionState = struct {
     allocator: mem.Allocator,
 
     pub fn init(allocator: mem.Allocator) !SessionState {
-        const dummy_kp = try curve.KeyPair.generate();
-        const dummy_ik = identity.IdentityKey.fromPublicKey(dummy_kp.public_key);
+        const zero_kp = try curve.KeyPair.generate();
+        const zero_ik = identity.IdentityKey.fromPublicKey(zero_kp.public_key);
         return SessionState{
             .session_version = SESSION_VERSION,
-            .local_identity_key = dummy_ik,
-            .remote_identity_key = dummy_ik,
+            .local_identity_key = zero_ik,
+            .remote_identity_key = zero_ik,
             .root_key = .{ .key = std.mem.zeroes([32]u8) },
             .previous_counter = 0,
             .sender_chain_key = ratchet_chain.ChainKey.init(std.mem.zeroes([32]u8), 0),
-            .sender_ratchet_key_pair = dummy_kp,
+            .sender_ratchet_key_pair = zero_kp,
             .receiver_chains = .empty,
             .pending_pre_key = null,
             .pending_kyber_pre_key = null,

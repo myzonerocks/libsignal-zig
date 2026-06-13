@@ -634,8 +634,8 @@ pub fn sealedSenderEncryptV2(
         const sid_bin = recipient.service_id.toFixedWidthBinary();
         try out.appendSlice(allocator, &sid_bin);
 
-        // device entry: device_id (u8) + reg_id_and_has_more (u16 BE, high bit = 0 = no more devices)
-        // We encode a single device with placeholder reg_id=0
+        // device entry: device_id (u8) + reg_id_and_has_more (u16 BE)
+        // Bits [15:1] = registration_id, bit 0 = has_more_devices (0 = final device for this service_id)
         try out.append(allocator, recipient.device_id);
         const reg_word: u16 = 0; // no more devices
         try out.append(allocator, @intCast(reg_word >> 8));
@@ -737,6 +737,64 @@ pub fn sealedSenderDecryptV2(
     }
 
     return plaintext;
+}
+
+/// Signal server per-device dispatch: extract the matching recipient entry from a
+/// multi-recipient 0x23 sent-message and return a per-device 0x22 received-message.
+/// The Signal server performs this step for every recipient device before delivery.
+/// Caller owns the returned slice.
+pub fn v2Dispatch(
+    allocator: mem.Allocator,
+    sent: []const u8,
+    service_id_fixed: [17]u8,
+    device_id: u8,
+) ![]u8 {
+    const ENTRY_LEN: usize = 17 + 1 + 2 + C_LEN + AT_LEN; // 68 bytes
+    if (sent.len < 2) return err.SignalError.InvalidMessage;
+    if (sent[0] != SSV2_SENT_VERSION) return err.SignalError.UnknownCiphertextVersion;
+
+    var pos: usize = 1;
+    var recipient_count: usize = 0;
+    var shift: u6 = 0;
+    while (pos < sent.len) {
+        const b = sent[pos];
+        pos += 1;
+        recipient_count |= @as(usize, b & 0x7F) << shift;
+        if (b & 0x80 == 0) break;
+        shift += 7;
+        if (shift >= 64) return err.SignalError.InvalidMessage;
+    }
+
+    const entries_start = pos;
+    const entries_end = entries_start + recipient_count * ENTRY_LEN;
+    if (entries_end + E_PUB_LEN > sent.len) return err.SignalError.InvalidMessage;
+
+    var found_c: ?[C_LEN]u8 = null;
+    var found_at: ?[AT_LEN]u8 = null;
+    for (0..recipient_count) |i| {
+        const e = entries_start + i * ENTRY_LEN;
+        const sid = sent[e .. e + 17];
+        const dev = sent[e + 17];
+        if (mem.eql(u8, sid, &service_id_fixed) and dev == device_id) {
+            found_c = sent[e + 20 .. e + 20 + C_LEN][0..C_LEN].*;
+            found_at = sent[e + 20 + C_LEN .. e + 20 + C_LEN + AT_LEN][0..AT_LEN].*;
+            break;
+        }
+    }
+
+    const c = found_c orelse return err.SignalError.InvalidKeyIdentifier;
+    const at = found_at orelse return err.SignalError.InvalidKeyIdentifier;
+
+    const e_pub: [E_PUB_LEN]u8 = sent[entries_end .. entries_end + E_PUB_LEN][0..E_PUB_LEN].*;
+    const ciphertext = sent[entries_end + E_PUB_LEN ..];
+
+    const recv = try allocator.alloc(u8, 1 + C_LEN + AT_LEN + E_PUB_LEN + ciphertext.len);
+    recv[0] = SSV2_RECV_VERSION;
+    @memcpy(recv[1..][0..C_LEN], &c);
+    @memcpy(recv[1 + C_LEN ..][0..AT_LEN], &at);
+    @memcpy(recv[1 + C_LEN + AT_LEN ..][0..E_PUB_LEN], &e_pub);
+    @memcpy(recv[1 + C_LEN + AT_LEN + E_PUB_LEN ..], ciphertext);
+    return recv;
 }
 
 fn writeVarint(v: usize, buf: []u8) usize {
