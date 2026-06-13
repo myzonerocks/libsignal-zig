@@ -1,5 +1,12 @@
 // SignalMessage (WhisperMessage) — the regular Double Ratchet encrypted message.
 // Wire format: [version_byte][protobuf_body][8-byte MAC]
+// Protobuf fields:
+//   1: ratchetKey (bytes)       — sender ratchet public key
+//   2: counter (uint32)
+//   3: previousCounter (uint32)
+//   4: ciphertext (bytes)
+//   5: pqRatchet (bytes)        — SPQR serialized state (v4 messages only)
+//   6: addresses (bytes)        — 36-byte address binding (optional; anti-relay protection)
 const std = @import("std");
 const curve = @import("../curve.zig");
 const proto = @import("../proto.zig");
@@ -10,6 +17,9 @@ const mem = std.mem;
 pub const CURRENT_VERSION: u8 = 4; // PQXDH + SPQR
 pub const MAC_LENGTH: usize = 8;
 
+// addresses field: [sender_service_id(17) || sender_device_id(1) || receiver_service_id(17) || receiver_device_id(1)]
+pub const ADDRESSES_FIELD_LEN: usize = 36;
+
 pub const SignalMessage = struct {
     message_version: u8,
     ratchet_key: curve.PublicKey,
@@ -17,6 +27,10 @@ pub const SignalMessage = struct {
     previous_counter: u32,
     ciphertext: []const u8,
     pq_ratchet: ?[]const u8,
+    // Optional 36-byte address binding. When present the MAC covers this field as part of the
+    // serialized protobuf body, binding the message to a specific sender/recipient pair and
+    // preventing server relay attacks.
+    addresses: ?[ADDRESSES_FIELD_LEN]u8,
     allocator: mem.Allocator,
 
     pub fn deinit(self: *SignalMessage) void {
@@ -44,6 +58,10 @@ pub const SignalMessage = struct {
         try enc.writeBytesField(4, self.ciphertext);
         if (self.pq_ratchet) |pqr| {
             if (pqr.len > 0) try enc.writeBytesField(5, pqr);
+        }
+        // addresses is written before the MAC is computed so it is covered by the MAC.
+        if (self.addresses) |addr| {
+            try enc.writeBytesField(6, &addr);
         }
 
         const body = try enc.toOwnedSlice();

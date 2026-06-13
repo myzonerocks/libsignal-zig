@@ -53,12 +53,13 @@ const MemIdentityStore = struct {
         const self: *MemIdentityStore = @ptrCast(@alignCast(ptr));
         return self.reg_id;
     }
-    fn saveIdentity(ptr: *anyopaque, addr: *const address.ProtocolAddress, key: identity.IdentityKey) anyerror!bool {
+    fn saveIdentity(ptr: *anyopaque, addr: *const address.ProtocolAddress, key: identity.IdentityKey) anyerror!storage.IdentityChange {
         const self: *MemIdentityStore = @ptrCast(@alignCast(ptr));
         const key_str = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ addr.name, addr.device_id });
         defer self.allocator.free(key_str);
+        const existed = self.trusted.contains(key_str);
         try self.trusted.put(try self.allocator.dupe(u8, key_str), key);
-        return true;
+        return if (existed) .replaced_existing else .new_or_unchanged;
     }
     fn isTrustedIdentity(_: *anyopaque, _: *const address.ProtocolAddress, _: identity.IdentityKey, _: storage.Direction) anyerror!bool {
         return true; // trust all for tests
@@ -237,18 +238,20 @@ const MemSenderKeyStore = struct {
         self.keys.deinit();
     }
 
-    fn storeSenderKey(ptr: *anyopaque, name: *const address.SenderKeyName, record: []const u8) anyerror!void {
+    fn storeSenderKey(ptr: *anyopaque, sender: *const address.ProtocolAddress, distribution_id: [16]u8, record: []const u8) anyerror!void {
         const self: *MemSenderKeyStore = @ptrCast(@alignCast(ptr));
-        const k = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ name.group_id, name.sender.name });
+        const hex_id = std.fmt.bytesToHex(distribution_id, .lower);
+        const k = try std.fmt.allocPrint(self.allocator, "{s}:{d}:{s}", .{ sender.name, sender.device_id, &hex_id });
         const v = try self.allocator.dupe(u8, record);
         const res = try self.keys.getOrPut(try self.allocator.dupe(u8, k));
         if (res.found_existing) self.allocator.free(res.value_ptr.*);
         res.value_ptr.* = v;
         self.allocator.free(k);
     }
-    fn loadSenderKey(ptr: *anyopaque, name: *const address.SenderKeyName) anyerror!?[]u8 {
+    fn loadSenderKey(ptr: *anyopaque, sender: *const address.ProtocolAddress, distribution_id: [16]u8) anyerror!?[]u8 {
         const self: *MemSenderKeyStore = @ptrCast(@alignCast(ptr));
-        const k = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ name.group_id, name.sender.name });
+        const hex_id = std.fmt.bytesToHex(distribution_id, .lower);
+        const k = try std.fmt.allocPrint(self.allocator, "{s}:{d}:{s}", .{ sender.name, sender.device_id, &hex_id });
         defer self.allocator.free(k);
         const v = self.keys.get(k) orelse return null;
         return try self.allocator.dupe(u8, v);
@@ -411,6 +414,9 @@ test "username hash" {
     try std.testing.expectEqualSlices(u8, &hash1.hash, &hash2.hash);
     // Different usernames → different hashes
     try std.testing.expect(!mem.eql(u8, &hash1.hash, &hash3.hash));
+    // Discriminator changes the hash
+    const hash4 = try username_mod.UsernameHash.compute("alice.42");
+    try std.testing.expect(!mem.eql(u8, &hash1.hash, &hash4.hash));
     // Invalid usernames rejected
     try std.testing.expectError(err.SignalError.InvalidArgument, username_mod.UsernameHash.compute("ab")); // too short
     try std.testing.expectError(err.SignalError.InvalidArgument, username_mod.UsernameHash.compute("1alice")); // starts with digit
@@ -418,11 +424,16 @@ test "username hash" {
 
 test "username proof and verify" {
     const randomness = rnd.fillArray(32);
+    const hash = try username_mod.UsernameHash.compute("alice_42");
     const proof = try username_mod.usernameProof(ally, "alice_42", randomness);
     defer ally.free(proof);
-    const valid = try username_mod.usernameVerify("alice_42", proof);
+    // Valid proof for the correct hash
+    const valid = try username_mod.usernameVerify(ally, hash.hash, proof);
     try std.testing.expect(valid);
-    const invalid = try username_mod.usernameVerify("bob", proof);
+    // Wrong hash must fail
+    var bad_hash = hash.hash;
+    bad_hash[0] ^= 0xFF;
+    const invalid = try username_mod.usernameVerify(ally, bad_hash, proof);
     try std.testing.expect(!invalid);
 }
 
@@ -679,13 +690,14 @@ test "group messaging" {
     var sender_key_store = MemSenderKeyStore.init(ally);
     defer sender_key_store.deinit();
 
-    const group_id = "group-abc-123";
     const sender_addr = address.ProtocolAddress{ .name = "alice", .device_id = 1 };
-    const skn = address.SenderKeyName{ .group_id = group_id, .sender = sender_addr };
+    // The caller assigns a distribution_id (UUID) that identifies this group session.
+    var distribution_id: [16]u8 = undefined;
+    rnd.bytes(&distribution_id);
 
     // Create a group session (sender side)
     var builder = group_session_builder_mod.GroupSessionBuilder.init(ally, sender_key_store.store());
-    const dist_msg = try builder.createSession(&skn);
+    const dist_msg = try builder.createSession(&sender_addr, distribution_id);
     defer {
         var m = dist_msg;
         m.deinit();
@@ -695,15 +707,15 @@ test "group messaging" {
     var member_key_store = MemSenderKeyStore.init(ally);
     defer member_key_store.deinit();
     var member_builder = group_session_builder_mod.GroupSessionBuilder.init(ally, member_key_store.store());
-    try member_builder.processSession(&skn, &dist_msg);
+    try member_builder.processSession(&sender_addr, &dist_msg);
 
     // Sender encrypts
-    var sender_cipher = group_cipher_mod.GroupCipher.init(ally, sender_key_store.store(), skn);
+    var sender_cipher = group_cipher_mod.GroupCipher.init(ally, sender_key_store.store(), sender_addr, distribution_id);
     const encrypted = try sender_cipher.encrypt("hello group!");
     defer ally.free(encrypted);
 
     // Member decrypts
-    var member_cipher = group_cipher_mod.GroupCipher.init(ally, member_key_store.store(), skn);
+    var member_cipher = group_cipher_mod.GroupCipher.init(ally, member_key_store.store(), sender_addr, distribution_id);
     const decrypted = try member_cipher.decrypt(encrypted);
     defer ally.free(decrypted);
     try std.testing.expectEqualSlices(u8, "hello group!", decrypted);

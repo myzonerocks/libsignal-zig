@@ -237,13 +237,17 @@ const IdentityStoreAdapter = struct {
         return id;
     }
 
-    fn saveIdentity(ptr: *anyopaque, addr: *const address_mod.ProtocolAddress, key: identity.IdentityKey) anyerror!bool {
+    fn saveIdentity(ptr: *anyopaque, addr: *const address_mod.ProtocolAddress, key: identity.IdentityKey) anyerror!storage.IdentityChange {
         const self: *IdentityStoreAdapter = @ptrCast(@alignCast(ptr));
-        const f = self.c.save_identity orelse return true;
+        const f = self.c.save_identity orelse return .new_or_unchanged;
         const name_z = try gpa.dupeZ(u8, addr.name);
         defer gpa.free(name_z);
         const key_bytes = key.serialize();
-        return f(self.c.ud, name_z, addr.device_id, &key_bytes) == 1;
+        // C callback returns 1 if an existing identity was replaced, 0 otherwise.
+        return if (f(self.c.ud, name_z, addr.device_id, &key_bytes) == 1)
+            storage.IdentityChange.replaced_existing
+        else
+            storage.IdentityChange.new_or_unchanged;
     }
 
     fn isTrustedIdentity(ptr: *anyopaque, addr: *const address_mod.ProtocolAddress, key: identity.IdentityKey, dir: storage.Direction) anyerror!bool {

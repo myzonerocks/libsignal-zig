@@ -43,6 +43,7 @@ pub const SenderKeyStateRecord = struct {
             defer allocator.free(sk_bytes);
             try enc.writeBytesField(3, sk_bytes);
         }
+        try enc.writeBytesField(4, &self.distribution_uuid);
         return enc.toOwnedSlice();
     }
 
@@ -54,6 +55,7 @@ pub const SenderKeyStateRecord = struct {
         var iteration: u32 = 0;
         var pk_bytes: ?[]const u8 = null;
         var sk_bytes_raw: ?[]const u8 = null;
+        var dist_uuid: [16]u8 = std.mem.zeroes([16]u8);
 
         while (try proto.nextField(data, &pos)) |field| {
             switch (field.number) {
@@ -91,6 +93,9 @@ pub const SenderKeyStateRecord = struct {
                         }
                     }
                 },
+                4 => if (field.wire_type == .len and field.data.len.len == 16) {
+                    @memcpy(&dist_uuid, field.data.len);
+                },
                 else => {},
             }
         }
@@ -102,7 +107,7 @@ pub const SenderKeyStateRecord = struct {
             .chain_key = chain_key,
             .iteration = iteration,
             .signing_key_pair = .{ .public_key = pk, .private_key = sk },
-            .distribution_uuid = std.mem.zeroes([16]u8),
+            .distribution_uuid = dist_uuid,
         };
     }
 };
@@ -115,12 +120,14 @@ pub const GroupSessionBuilder = struct {
         return .{ .sender_key_store = sender_key_store, .allocator = allocator };
     }
 
-    /// Create or retrieve the SenderKeyDistributionMessage for a group/sender pair.
+    /// Create or retrieve the SenderKeyDistributionMessage for a sender + distribution_id.
+    /// The distribution_id is the caller-assigned UUID that identifies this group session.
     pub fn createSession(
         self: *GroupSessionBuilder,
-        sender_key_name: *const address_mod.SenderKeyName,
+        sender: *const address_mod.ProtocolAddress,
+        distribution_id: [16]u8,
     ) !skdm_mod.SenderKeyDistributionMessage {
-        const existing = try self.sender_key_store.loadSenderKey(sender_key_name);
+        const existing = try self.sender_key_store.loadSenderKey(sender, distribution_id);
 
         if (existing) |record_bytes| {
             defer self.allocator.free(record_bytes);
@@ -138,9 +145,7 @@ pub const GroupSessionBuilder = struct {
         }
 
         // Generate new sender key state
-        var uuid: [16]u8 = undefined;
-        rnd.bytes(&uuid);
-        const chain_id = std.mem.readInt(u32, uuid[0..4], .little);
+        const chain_id = std.mem.readInt(u32, distribution_id[0..4], .little);
         var chain_key: [32]u8 = undefined;
         rnd.bytes(&chain_key);
         const signing_kp = try curve.KeyPair.generate();
@@ -151,16 +156,16 @@ pub const GroupSessionBuilder = struct {
             .chain_key = chain_key,
             .iteration = 0,
             .signing_key_pair = signing_kp,
-            .distribution_uuid = uuid,
+            .distribution_uuid = distribution_id,
         };
 
         const record_bytes = try state.serialize(self.allocator);
         defer self.allocator.free(record_bytes);
-        try self.sender_key_store.storeSenderKey(sender_key_name, record_bytes);
+        try self.sender_key_store.storeSenderKey(sender, distribution_id, record_bytes);
 
         return skdm_mod.SenderKeyDistributionMessage.new(
             self.allocator,
-            uuid,
+            distribution_id,
             chain_id,
             0,
             chain_key,
@@ -171,7 +176,7 @@ pub const GroupSessionBuilder = struct {
     /// Process a received SenderKeyDistributionMessage and store the sender key.
     pub fn processSession(
         self: *GroupSessionBuilder,
-        sender_key_name: *const address_mod.SenderKeyName,
+        sender: *const address_mod.ProtocolAddress,
         distribution_msg: *const skdm_mod.SenderKeyDistributionMessage,
     ) !void {
         const state = SenderKeyStateRecord{
@@ -188,6 +193,6 @@ pub const GroupSessionBuilder = struct {
 
         const record_bytes = try state.serialize(self.allocator);
         defer self.allocator.free(record_bytes);
-        try self.sender_key_store.storeSenderKey(sender_key_name, record_bytes);
+        try self.sender_key_store.storeSenderKey(sender, distribution_msg.distribution_uuid, record_bytes);
     }
 };

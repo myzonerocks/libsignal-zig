@@ -1,20 +1,41 @@
 // Sealed Sender: anonymous delivery of Signal Protocol messages.
 // Hides sender identity from the Signal server while still authenticating to recipient.
-// Based on Signal's UnidentifiedDelivery protocol.
+//
+// V1 (sealedSenderEncrypt / sealedSenderDecryptToUsmc):
+//   Single-recipient AES-256-CBC. Wire: protobuf {ephemeralPub, encryptedStatic, encryptedMessage}.
+//
+// V2 (sealedSenderEncryptV2 / sealedSenderDecryptV2):
+//   Multi-recipient AES-256-GCM-SIV. One shared ciphertext; per-recipient (C_i, AT_i) pair.
+//   Sent message version byte 0x23; received message version byte 0x22.
 const std = @import("std");
 const curve = @import("curve.zig");
 const identity = @import("identity.zig");
+const service_id_mod = @import("service_id.zig");
+const address_mod = @import("address.zig");
 const proto = @import("proto.zig");
 const kdf = @import("kdf.zig");
 const rnd = @import("random.zig");
-const xeddsa = @import("xeddsa.zig");
+const aes_mod = @import("aes.zig");
 const err = @import("error.zig");
 const aes_cbc = @import("session_builder.zig").aes_cbc;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const mem = std.mem;
 
-// Message type values
+// ---- V2 constants ----
+const SSV2_SENT_VERSION: u8 = 0x23; // ServiceId-typed recipients
+const SSV2_RECV_VERSION: u8 = 0x22; // per-device received format
+
+const LABEL_R = "Sealed Sender v2: r (2023-08)";
+const LABEL_K = "Sealed Sender v2: K";
+const LABEL_DH = "Sealed Sender v2: DH";
+const LABEL_DH_S = "Sealed Sender v2: DH-sender";
+
+const C_LEN: usize = 32;
+const AT_LEN: usize = 16;
+const E_PUB_LEN: usize = 32; // raw Curve25519, no type byte
+
+// ---- Message type values ----
 pub const ContentType = enum(u8) {
     prekey_message = 1,
     message = 2,
@@ -31,7 +52,7 @@ pub const ContentHint = enum(u8) {
 pub const ServerCertificate = struct {
     key_id: u32,
     key: curve.PublicKey,
-    certificate: []const u8, // serialized Certificate sub-message
+    certificate: []const u8,
     signature: [64]u8,
     allocator: mem.Allocator,
 
@@ -93,7 +114,6 @@ pub const ServerCertificate = struct {
         const sig_raw = sig_bytes orelse return err.SignalError.InvalidArgument;
         if (sig_raw.len != 64) return err.SignalError.InvalidSignature;
 
-        // Parse the certificate sub-message
         var cert_pos: usize = 0;
         var key_id: u32 = 0;
         var key_bytes: ?[]const u8 = null;
@@ -149,7 +169,6 @@ pub const SenderCertificate = struct {
         try cert_enc.writeFixed64Field(3, expiration);
         const sk_bytes = sender_key.serialize();
         try cert_enc.writeBytesField(4, &sk_bytes);
-        // Embed server certificate
         const sc_bytes = try server_cert.serialize();
         defer allocator.free(sc_bytes);
         try cert_enc.writeBytesField(5, sc_bytes);
@@ -223,9 +242,6 @@ pub const SenderCertificate = struct {
         var cert_pos: usize = 0;
         while (try proto.nextField(cert, &cert_pos)) |field| {
             switch (field.number) {
-                6 => {
-                    if (field.wire_type == .len) uuid = field.data.len;
-                },
                 1 => {
                     if (field.wire_type == .len) e164 = field.data.len;
                 },
@@ -241,6 +257,9 @@ pub const SenderCertificate = struct {
                 5 => {
                     if (field.wire_type == .len) server_cert_bytes = field.data.len;
                 },
+                6 => {
+                    if (field.wire_type == .len) uuid = field.data.len;
+                },
                 else => {},
             }
         }
@@ -252,18 +271,14 @@ pub const SenderCertificate = struct {
             server_cert_bytes orelse return err.SignalError.InvalidArgument,
         );
 
-        const cert_copy = try allocator.dupe(u8, cert);
-        const uuid_copy = try allocator.dupe(u8, uuid_str);
-        const e164_copy = if (e164) |e| try allocator.dupe(u8, e) else null;
-
         return .{
-            .sender_uuid = uuid_copy,
-            .sender_e164 = e164_copy,
+            .sender_uuid = try allocator.dupe(u8, uuid_str),
+            .sender_e164 = if (e164) |e| try allocator.dupe(u8, e) else null,
             .sender_device_id = device_id,
             .sender_key = sender_key,
             .expiration = expiration,
             .signer = server_cert,
-            .certificate = cert_copy,
+            .certificate = try allocator.dupe(u8, cert),
             .signature = sig_raw[0..64].*,
             .allocator = allocator,
         };
@@ -361,65 +376,60 @@ pub const UnidentifiedSenderMessageContent = struct {
     }
 };
 
-/// Encrypt a message for sealed sender delivery.
+// ---- V1 ----
+
+fn hkdfDeriveUnidentified(dh_output: [32]u8) [96]u8 {
+    const prk = HkdfSha256.extract("UnidentifiedDelivery", &dh_output);
+    var out: [96]u8 = undefined;
+    HkdfSha256.expand(&out, "", prk);
+    return out;
+}
+
+/// Encrypt a message for V1 sealed sender delivery.
 /// Returns the UnidentifiedSenderMessage bytes to send to the server.
 pub fn sealedSenderEncrypt(
     allocator: mem.Allocator,
     recipient_identity: curve.PublicKey,
     usmc: *const UnidentifiedSenderMessageContent,
 ) ![]u8 {
-    // Serialize the USMC
     const plaintext = try usmc.serialize();
     defer allocator.free(plaintext);
 
-    // Generate ephemeral key
     const ephemeral_kp = try curve.KeyPair.generate();
     const ephemeral_pub = ephemeral_kp.public_key.serialize();
 
-    // DH(ephemeral, recipient_identity)
+    // DH(e, recipient) → derive ephemeral-layer keys
     const ecdh_1 = try ephemeral_kp.private_key.calculateAgreement(recipient_identity);
-
-    // Derive ephemeral keys
-    const static_key_info = "UnidentifiedDelivery";
-    var e_keys: [96]u8 = undefined; // 32 chain + 32 cipher + 32 mac
-    const e_prk = HkdfSha256.extract(static_key_info, &ecdh_1);
-    HkdfSha256.expand(&e_keys, "", e_prk);
+    const e_keys = hkdfDeriveUnidentified(ecdh_1);
+    const e_iv: [16]u8 = e_keys[0..16].*;
     const e_cipher_key: [32]u8 = e_keys[32..64].*;
     const e_mac_key: [32]u8 = e_keys[64..96].*;
-    const e_iv: [16]u8 = e_keys[0..16].*;
 
-    // Encrypt the USMC
     const e_ciphertext = try aes_cbc.encrypt(allocator, e_cipher_key, e_iv, plaintext);
     defer allocator.free(e_ciphertext);
 
-    // Compute e_mac
     var e_mac_engine = HmacSha256.init(&e_mac_key);
     e_mac_engine.update(&ephemeral_pub);
     e_mac_engine.update(e_ciphertext);
     var e_mac: [32]u8 = undefined;
     e_mac_engine.final(&e_mac);
 
-    // DH(sender_identity, recipient_identity) for static key
-    const sender_identity_key = usmc.sender_cert.sender_key;
-    const ecdh_2 = try ephemeral_kp.private_key.calculateAgreement(sender_identity_key);
-
-    // Derive static keys
-    // Static key derivation uses the e_chain + e_ciphertext + e_mac[0..8]
-    var static_ikm: [32 + 8]u8 = undefined;
+    // DH(e, sender_identity_key) → static-layer binding (proves sender used their identity key)
+    const ecdh_2 = try ephemeral_kp.private_key.calculateAgreement(usmc.sender_cert.sender_key);
+    var static_ikm: [40]u8 = undefined;
     @memcpy(static_ikm[0..32], &ecdh_2);
     @memcpy(static_ikm[32..40], e_mac[0..8]);
-    var s_keys: [96]u8 = undefined;
     const s_prk = HkdfSha256.extract("", &static_ikm);
+    var s_keys: [96]u8 = undefined;
     HkdfSha256.expand(&s_keys, "", s_prk);
+    const s_iv: [16]u8 = s_keys[0..16].*;
     const s_cipher_key: [32]u8 = s_keys[32..64].*;
     const s_mac_key: [32]u8 = s_keys[64..96].*;
-    const s_iv: [16]u8 = s_keys[0..16].*;
 
-    // Build static plaintext: sender_cert bytes + e_ciphertext + e_mac[0..8]
-    var static_pt: std.ArrayList(u8) = .empty;
-    defer static_pt.deinit(allocator);
     const sc_bytes = try usmc.sender_cert.serialize();
     defer allocator.free(sc_bytes);
+    var static_pt = std.ArrayListUnmanaged(u8){};
+    defer static_pt.deinit(allocator);
     try static_pt.appendSlice(allocator, sc_bytes);
     try static_pt.appendSlice(allocator, e_ciphertext);
     try static_pt.appendSlice(allocator, e_mac[0..8]);
@@ -433,11 +443,16 @@ pub fn sealedSenderEncrypt(
     var s_mac: [32]u8 = undefined;
     s_mac_engine.final(&s_mac);
 
-    // Build the outer UnidentifiedSenderMessage proto
+    // encrypted_static = s_ciphertext || s_mac[0..10]
+    const encrypted_static = try allocator.alloc(u8, s_ciphertext.len + 10);
+    defer allocator.free(encrypted_static);
+    @memcpy(encrypted_static[0..s_ciphertext.len], s_ciphertext);
+    @memcpy(encrypted_static[s_ciphertext.len..], s_mac[0..10]);
+
     var enc = proto.Encoder.init(allocator);
     defer enc.deinit();
     try enc.writeBytesField(1, &ephemeral_pub);
-    try enc.writeBytesField(2, s_ciphertext);
+    try enc.writeBytesField(2, encrypted_static);
     try enc.writeBytesField(3, e_ciphertext);
 
     return enc.toOwnedSlice();
@@ -458,25 +473,20 @@ pub const SealedSenderDecryptResult = struct {
     }
 };
 
-/// Decrypt a sealed sender message (recipient side).
+/// Decrypt a V1 sealed sender message (recipient side).
 pub fn sealedSenderDecryptToUsmc(
     allocator: mem.Allocator,
     data: []const u8,
     our_identity: curve.PrivateKey,
 ) !UnidentifiedSenderMessageContent {
-    // Parse outer UnidentifiedSenderMessage
     var pos: usize = 0;
     var ephemeral_pub_bytes: ?[]const u8 = null;
-    var encrypted_static: ?[]const u8 = null;
     var encrypted_message: ?[]const u8 = null;
 
     while (try proto.nextField(data, &pos)) |field| {
         switch (field.number) {
             1 => {
                 if (field.wire_type == .len) ephemeral_pub_bytes = field.data.len;
-            },
-            2 => {
-                if (field.wire_type == .len) encrypted_static = field.data.len;
             },
             3 => {
                 if (field.wire_type == .len) encrypted_message = field.data.len;
@@ -486,36 +496,261 @@ pub fn sealedSenderDecryptToUsmc(
     }
 
     const e_pub_raw = ephemeral_pub_bytes orelse return err.SignalError.InvalidMessage;
-    const encrypted_static_raw = encrypted_static orelse return err.SignalError.InvalidMessage;
     const encrypted_message_raw = encrypted_message orelse return err.SignalError.InvalidMessage;
 
     const ephemeral_pub = try curve.PublicKey.deserialize(e_pub_raw);
-    const ephemeral_pub_serialized = ephemeral_pub.serialize();
 
-    // Decrypt static layer
+    // Derive ephemeral-layer keys
     const ecdh_1 = try our_identity.calculateAgreement(ephemeral_pub);
-    var e_keys: [96]u8 = undefined;
-    const e_prk = HkdfSha256.extract("UnidentifiedDelivery", &ecdh_1);
-    HkdfSha256.expand(&e_keys, "", e_prk);
-    const e_cipher_key: [32]u8 = e_keys[32..64].*;
-    const e_mac_key: [32]u8 = e_keys[64..96].*;
+    const e_keys = hkdfDeriveUnidentified(ecdh_1);
     const e_iv: [16]u8 = e_keys[0..16].*;
+    const e_cipher_key: [32]u8 = e_keys[32..64].*;
 
-    // Verify + decrypt encrypted_message to get USMC
-    var e_mac_engine = HmacSha256.init(&e_mac_key);
-    e_mac_engine.update(&ephemeral_pub_serialized);
-    e_mac_engine.update(encrypted_message_raw);
-    var e_mac: [32]u8 = undefined;
-    e_mac_engine.final(&e_mac);
-
-    // Decrypt static to get sender cert + encrypted message mac
-    var static_ikm: [32 + 8]u8 = undefined;
-    _ = encrypted_static_raw;
-    @memcpy(static_ikm[32..40], e_mac[0..8]);
-
-    // Decrypt the inner message
     const usmc_bytes = try aes_cbc.decrypt(allocator, e_cipher_key, e_iv, encrypted_message_raw);
     defer allocator.free(usmc_bytes);
 
     return UnidentifiedSenderMessageContent.deserialize(allocator, usmc_bytes);
+}
+
+// ---- V2 ----
+
+/// One recipient for SSv2 encryption.
+pub const SealedSenderV2Recipient = struct {
+    service_id: service_id_mod.ServiceId,
+    device_id: u8,
+    identity_key: curve.PublicKey,
+};
+
+/// SSv2 per-recipient data embedded in the received message.
+pub const SealedSenderV2ReceivedData = struct {
+    c: [C_LEN]u8,
+    at: [AT_LEN]u8,
+    e_pub: [E_PUB_LEN]u8,
+    ciphertext: []const u8, // borrowed from the received message bytes
+};
+
+fn hkdfV2(ikm: []const u8, info: []const u8, out: []u8) void {
+    const prk = HkdfSha256.extract("", ikm);
+    // HKDF-SHA256 expand in 32-byte blocks
+    var counter: u8 = 1;
+    var prev: [32]u8 = undefined;
+    var produced: usize = 0;
+    while (produced < out.len) {
+        var h = HmacSha256.init(&@as([32]u8, prk));
+        if (produced > 0) h.update(&prev);
+        h.update(info);
+        h.update(&[1]u8{counter});
+        var block: [32]u8 = undefined;
+        h.final(&block);
+        prev = block;
+        const chunk = @min(32, out.len - produced);
+        @memcpy(out[produced .. produced + chunk], block[0..chunk]);
+        produced += chunk;
+        counter += 1;
+    }
+}
+
+fn computePad(e_priv_bytes: [32]u8, r_pub: curve.PublicKey, e_pub_bytes: [32]u8) ![32]u8 {
+    const e_priv = curve.PrivateKey.fromBytes(e_priv_bytes);
+    const dh = try e_priv.calculateAgreement(r_pub);
+    // ikm = DH(e, R) || e_pub || R_pub
+    var ikm: [32 + 32 + 32]u8 = undefined;
+    @memcpy(ikm[0..32], &dh);
+    @memcpy(ikm[32..64], &e_pub_bytes);
+    @memcpy(ikm[64..96], &r_pub.key_bytes);
+    var pad: [32]u8 = undefined;
+    hkdfV2(&ikm, LABEL_DH, &pad);
+    return pad;
+}
+
+fn computeAt(
+    s_priv: curve.PrivateKey,
+    r_pub: curve.PublicKey,
+    e_pub_bytes: [32]u8,
+    c: [32]u8,
+    s_pub_bytes: [32]u8,
+) ![AT_LEN]u8 {
+    const dh_s = try s_priv.calculateAgreement(r_pub);
+    // ikm = DH(S, R) || e_pub || C || S_pub || R_pub
+    var ikm: [32 + 32 + 32 + 32 + 32]u8 = undefined;
+    @memcpy(ikm[0..32], &dh_s);
+    @memcpy(ikm[32..64], &e_pub_bytes);
+    @memcpy(ikm[64..96], &c);
+    @memcpy(ikm[96..128], &s_pub_bytes);
+    @memcpy(ikm[128..160], &r_pub.key_bytes);
+    var at: [AT_LEN]u8 = undefined;
+    hkdfV2(&ikm, LABEL_DH_S, &at);
+    return at;
+}
+
+/// Encrypt a message for SSv2 multi-recipient delivery.
+/// Returns the complete sent-message bytes (version 0x23 format) to upload to the Signal server.
+pub fn sealedSenderEncryptV2(
+    allocator: mem.Allocator,
+    message: []const u8,
+    sender_identity_kp: curve.KeyPair,
+    recipients: []const SealedSenderV2Recipient,
+    excluded: []const service_id_mod.ServiceId,
+) ![]u8 {
+    // Step 1: generate 32 random bytes, derive ephemeral keypair + AES key
+    var m: [32]u8 = undefined;
+    rnd.bytes(&m);
+
+    var e_priv_bytes: [32]u8 = undefined;
+    hkdfV2(&m, LABEL_R, &e_priv_bytes);
+    // Clamp as X25519 private key
+    e_priv_bytes[0] &= 248;
+    e_priv_bytes[31] &= 127;
+    e_priv_bytes[31] |= 64;
+
+    const e_priv = curve.PrivateKey.fromBytes(e_priv_bytes);
+    const e_pub_bytes = e_priv.publicKey().key_bytes;
+
+    var K: [32]u8 = undefined;
+    hkdfV2(&m, LABEL_K, &K);
+
+    // Step 2: AES-256-GCM-SIV encrypt message (once, shared across all recipients)
+    const nonce = [_]u8{0} ** 12;
+    const ciphertext_with_tag = try aes_mod.gcm_siv_encrypt(allocator, K, nonce, message, &[0]u8{});
+    defer allocator.free(ciphertext_with_tag);
+
+    const s_pub_bytes = sender_identity_kp.public_key.key_bytes;
+
+    // Step 3: per-recipient C_i and AT_i
+    const total_recipients = recipients.len + excluded.len;
+
+    var out = std.ArrayListUnmanaged(u8){};
+    defer out.deinit(allocator);
+
+    try out.append(allocator, SSV2_SENT_VERSION);
+
+    // Write count as protobuf-style varint
+    var varint_buf: [10]u8 = undefined;
+    const varint_len = writeVarint(total_recipients, &varint_buf);
+    try out.appendSlice(allocator, varint_buf[0..varint_len]);
+
+    for (recipients) |recipient| {
+        // service_id fixed-width binary (17 bytes)
+        const sid_bin = recipient.service_id.toFixedWidthBinary();
+        try out.appendSlice(allocator, &sid_bin);
+
+        // device entry: device_id (u8) + reg_id_and_has_more (u16 BE, high bit = 0 = no more devices)
+        // We encode a single device with placeholder reg_id=0
+        try out.append(allocator, recipient.device_id);
+        const reg_word: u16 = 0; // no more devices
+        try out.append(allocator, @intCast(reg_word >> 8));
+        try out.append(allocator, @intCast(reg_word & 0xFF));
+
+        // C_i = pad XOR m
+        const pad = try computePad(e_priv_bytes, recipient.identity_key, e_pub_bytes);
+        var c: [32]u8 = undefined;
+        for (0..32) |i| c[i] = pad[i] ^ m[i];
+        try out.appendSlice(allocator, &c);
+
+        // AT_i
+        const at = try computeAt(sender_identity_kp.private_key, recipient.identity_key, e_pub_bytes, c, s_pub_bytes);
+        try out.appendSlice(allocator, &at);
+    }
+
+    // Excluded recipients: service_id || 0x00
+    for (excluded) |sid| {
+        const sid_bin = sid.toFixedWidthBinary();
+        try out.appendSlice(allocator, &sid_bin);
+        try out.append(allocator, 0x00);
+    }
+
+    // Shared suffix: e_pub (raw 32 bytes) || ciphertext_with_tag
+    try out.appendSlice(allocator, &e_pub_bytes);
+    try out.appendSlice(allocator, ciphertext_with_tag);
+
+    return out.toOwnedSlice(allocator);
+}
+
+/// Decrypt a received SSv2 message (per-device received format, version 0x22).
+/// received_data layout: 0x22 || C[32] || AT[16] || e_pub[32] || ciphertext_with_tag[...]
+pub fn sealedSenderDecryptV2(
+    allocator: mem.Allocator,
+    received: []const u8,
+    our_identity_kp: curve.KeyPair,
+    sender_identity_pub: curve.PublicKey,
+) ![]u8 {
+    if (received.len < 1 + C_LEN + AT_LEN + E_PUB_LEN + 16)
+        return err.SignalError.InvalidMessage;
+    if (received[0] != SSV2_RECV_VERSION)
+        return err.SignalError.InvalidVersion;
+
+    var pos: usize = 1;
+    const c: [32]u8 = received[pos .. pos + 32].*;
+    pos += 32;
+    const at: [16]u8 = received[pos .. pos + 16].*;
+    pos += 16;
+    const e_pub_bytes: [32]u8 = received[pos .. pos + 32].*;
+    pos += 32;
+    const ciphertext_with_tag = received[pos..];
+
+    const e_pub = curve.PublicKey.fromBytes(e_pub_bytes);
+
+    // Recover m: pad = HKDF(DH(our_priv, e_pub) || e_pub || our_pub, LABEL_DH)
+    const r_priv = our_identity_kp.private_key;
+    const r_pub_bytes = our_identity_kp.public_key.key_bytes;
+    const dh = try r_priv.calculateAgreement(e_pub);
+    var ikm_dh: [96]u8 = undefined;
+    @memcpy(ikm_dh[0..32], &dh);
+    @memcpy(ikm_dh[32..64], &e_pub_bytes);
+    @memcpy(ikm_dh[64..96], &r_pub_bytes);
+    var pad: [32]u8 = undefined;
+    hkdfV2(&ikm_dh, LABEL_DH, &pad);
+    var m: [32]u8 = undefined;
+    for (0..32) |i| m[i] = pad[i] ^ c[i];
+
+    // Verify ephemeral key consistency
+    var e_derived: [32]u8 = undefined;
+    hkdfV2(&m, LABEL_R, &e_derived);
+    e_derived[0] &= 248;
+    e_derived[31] &= 127;
+    e_derived[31] |= 64;
+    const derived_pub = curve.PrivateKey.fromBytes(e_derived).publicKey().key_bytes;
+    if (!mem.eql(u8, &derived_pub, &e_pub_bytes))
+        return err.SignalError.InvalidMessage;
+
+    // Decrypt
+    var K: [32]u8 = undefined;
+    hkdfV2(&m, LABEL_K, &K);
+    const nonce = [_]u8{0} ** 12;
+    const plaintext = try aes_mod.gcm_siv_decrypt(allocator, K, nonce, ciphertext_with_tag, &[0]u8{});
+    errdefer allocator.free(plaintext);
+
+    // Verify authentication tag AT
+    var ikm_s: [160]u8 = undefined;
+    const dh_s = try r_priv.calculateAgreement(sender_identity_pub);
+    @memcpy(ikm_s[0..32], &dh_s);
+    @memcpy(ikm_s[32..64], &e_pub_bytes);
+    @memcpy(ikm_s[64..96], &c);
+    @memcpy(ikm_s[96..128], &sender_identity_pub.key_bytes);
+    @memcpy(ikm_s[128..160], &r_pub_bytes);
+    var expected_at: [AT_LEN]u8 = undefined;
+    hkdfV2(&ikm_s, LABEL_DH_S, &expected_at);
+
+    if (!std.crypto.utils.timingSafeEql([AT_LEN]u8, at, expected_at)) {
+        allocator.free(plaintext);
+        return err.SignalError.InvalidMessage;
+    }
+
+    return plaintext;
+}
+
+fn writeVarint(v: usize, buf: []u8) usize {
+    var val = v;
+    var pos: usize = 0;
+    while (true) {
+        if (val < 0x80) {
+            buf[pos] = @intCast(val);
+            pos += 1;
+            break;
+        }
+        buf[pos] = @intCast((val & 0x7F) | 0x80);
+        pos += 1;
+        val >>= 7;
+    }
+    return pos;
 }

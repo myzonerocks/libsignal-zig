@@ -106,6 +106,7 @@ pub const SessionCipher = struct {
                 .previous_counter = state.previous_counter,
                 .ciphertext = ciphertext,
                 .pq_ratchet = pqr_msg,
+                .addresses = null,
                 .allocator = self.allocator,
             };
             const signal_bytes = try signal_msg.serialize(
@@ -147,6 +148,7 @@ pub const SessionCipher = struct {
             .previous_counter = state.previous_counter,
             .ciphertext = ciphertext,
             .pq_ratchet = pqr_msg,
+            .addresses = null,
             .allocator = self.allocator,
         };
         const serialized = try signal_msg.serialize(

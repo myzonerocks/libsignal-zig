@@ -1,7 +1,12 @@
 const std = @import("std");
 const mem = std.mem;
 
+/// E.164-format phone number (e.g. "+15551234567").
+/// Borrowed — caller owns the lifetime.
+pub const E164 = []const u8;
+
 /// A Signal Protocol address: name + device_id.
+/// `name` must be a ServiceId string (ACI UUID or "PNI:UUID") for any post-2023 usage.
 /// `name` is a borrowed slice — caller owns its lifetime.
 pub const ProtocolAddress = struct {
     name: []const u8,
@@ -24,6 +29,7 @@ pub const ProtocolAddress = struct {
 };
 
 /// Identifies a sender within a group.
+/// Kept as a utility type; the SenderKeyStore interface uses (ProtocolAddress, distribution_id) directly.
 /// All slices are borrowed — caller owns their lifetime.
 pub const SenderKeyName = struct {
     group_id: []const u8,

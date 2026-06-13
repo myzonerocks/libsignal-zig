@@ -2,6 +2,7 @@
 // Implements v1 fingerprint (iterative SHA-512 hashing).
 const std = @import("std");
 const identity = @import("identity.zig");
+const curve = @import("curve.zig");
 const proto = @import("proto.zig");
 const err = @import("error.zig");
 const Sha512 = std.crypto.hash.sha2.Sha512;
@@ -42,13 +43,52 @@ fn hashForDisplay(key: []const u8, stable_id: []const u8) [30]u8 {
 pub const DisplayableFingerprint = struct {
     displayable: [60]u8,
 
-    pub fn format(self: DisplayableFingerprint) [60]u8 {
+    pub fn digits(self: DisplayableFingerprint) [60]u8 {
         return self.displayable;
+    }
+
+    /// Constant-time comparison to prevent timing attacks during key verification.
+    pub fn eql(self: DisplayableFingerprint, other: DisplayableFingerprint) bool {
+        return std.crypto.utils.timingSafeEql([60]u8, self.displayable, other.displayable);
+    }
+
+    pub fn format(
+        self: DisplayableFingerprint,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = fmt;
+        _ = options;
+        try writer.writeAll(&self.displayable);
     }
 };
 
+fn computeDisplayableRaw(
+    local_key_bytes: *const [curve.SERIALIZED_PUBLIC_KEY_LENGTH]u8,
+    local_stable_id: []const u8,
+    remote_key_bytes: *const [curve.SERIALIZED_PUBLIC_KEY_LENGTH]u8,
+    remote_stable_id: []const u8,
+) DisplayableFingerprint {
+    const local_hash = hashForDisplay(local_key_bytes, local_stable_id);
+    const remote_hash = hashForDisplay(remote_key_bytes, remote_stable_id);
+    var result: [60]u8 = undefined;
+    var out_pos: usize = 0;
+    for ([2][30]u8{ local_hash, remote_hash }) |hash| {
+        var i: usize = 0;
+        while (i + 5 <= 30) : (i += 5) {
+            var val: u64 = 0;
+            for (hash[i .. i + 5]) |b| val = (val << 8) | b;
+            val = val % 100000;
+            _ = std.fmt.bufPrint(result[out_pos..][0..5], "{d:0>5}", .{val}) catch unreachable;
+            out_pos += 5;
+        }
+    }
+    return .{ .displayable = result };
+}
+
 /// Compute a displayable fingerprint for key comparison.
-/// Returns a string of 120 decimal digits (12 groups of 5 per side).
+/// Returns a 60-character decimal digit string (6 groups of 5 digits per side).
 pub fn computeDisplayableFingerprint(
     allocator: mem.Allocator,
     local_key: identity.IdentityKey,
@@ -58,31 +98,30 @@ pub fn computeDisplayableFingerprint(
 ) ![]u8 {
     const local_key_bytes = local_key.serialize();
     const remote_key_bytes = remote_key.serialize();
-
-    const local_hash = hashForDisplay(&local_key_bytes, local_stable_id);
-    const remote_hash = hashForDisplay(&remote_key_bytes, remote_stable_id);
-
-    // Each side: 30 bytes → 6 groups of 5 bytes → 6 groups of 5 decimal digits
-    // Total: 6 groups * 2 sides * 5 digits = 60 digits per side, 120 total
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-
-    for ([2][30]u8{ local_hash, remote_hash }) |hash| {
-        var i: usize = 0;
-        while (i + 5 <= 30) : (i += 5) {
-            var val: u64 = 0;
-            for (hash[i .. i + 5]) |b| {
-                val = (val << 8) | b;
-            }
-            val = val % 100000;
-            const group_str = try std.fmt.allocPrint(allocator, "{d:0>5}", .{val});
-            defer allocator.free(group_str);
-            try out.appendSlice(allocator, group_str);
-        }
-    }
-
-    return out.toOwnedSlice(allocator);
+    const fp = computeDisplayableRaw(&local_key_bytes, local_stable_id, &remote_key_bytes, remote_stable_id);
+    return try allocator.dupe(u8, &fp.displayable);
 }
+
+/// Composite fingerprint combining both displayable and scannable representations.
+pub const Fingerprint = struct {
+    displayable: DisplayableFingerprint,
+    scannable: ScannableFingerprint,
+
+    pub fn compute(
+        allocator: mem.Allocator,
+        local_key: identity.IdentityKey,
+        local_stable_id: []const u8,
+        remote_key: identity.IdentityKey,
+        remote_stable_id: []const u8,
+    ) !Fingerprint {
+        const local_key_bytes = local_key.serialize();
+        const remote_key_bytes = remote_key.serialize();
+        return .{
+            .displayable = computeDisplayableRaw(&local_key_bytes, local_stable_id, &remote_key_bytes, remote_stable_id),
+            .scannable = try ScannableFingerprint.compute(allocator, local_key, local_stable_id, remote_key, remote_stable_id),
+        };
+    }
+};
 
 pub const ScannableFingerprint = struct {
     version: u32,

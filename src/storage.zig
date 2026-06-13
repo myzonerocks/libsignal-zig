@@ -10,8 +10,13 @@ const SignedPreKeyRecord = @import("state/signed_pre_key_record.zig").SignedPreK
 const KyberPreKeyRecord = @import("state/kyber_pre_key_record.zig").KyberPreKeyRecord;
 const mem = std.mem;
 
-// Direction for trust evaluation
 pub const Direction = enum { sending, receiving };
+
+// Result of saveIdentity: whether a new key was stored or an existing key was replaced.
+pub const IdentityChange = enum {
+    new_or_unchanged,
+    replaced_existing,
+};
 
 // Identity Key Store
 pub const IdentityKeyStore = struct {
@@ -21,9 +26,9 @@ pub const IdentityKeyStore = struct {
     pub const VTable = struct {
         getIdentityKeyPair: *const fn (ptr: *anyopaque) anyerror!identity.IdentityKeyPair,
         getLocalRegistrationId: *const fn (ptr: *anyopaque) anyerror!u32,
-        saveIdentity: *const fn (ptr: *anyopaque, address: *const address.ProtocolAddress, key: identity.IdentityKey) anyerror!bool,
-        isTrustedIdentity: *const fn (ptr: *anyopaque, address: *const address.ProtocolAddress, key: identity.IdentityKey, dir: Direction) anyerror!bool,
-        getIdentity: *const fn (ptr: *anyopaque, address: *const address.ProtocolAddress) anyerror!?identity.IdentityKey,
+        saveIdentity: *const fn (ptr: *anyopaque, addr: *const address.ProtocolAddress, key: identity.IdentityKey) anyerror!IdentityChange,
+        isTrustedIdentity: *const fn (ptr: *anyopaque, addr: *const address.ProtocolAddress, key: identity.IdentityKey, dir: Direction) anyerror!bool,
+        getIdentity: *const fn (ptr: *anyopaque, addr: *const address.ProtocolAddress) anyerror!?identity.IdentityKey,
     };
 
     pub fn getIdentityKeyPair(self: IdentityKeyStore) !identity.IdentityKeyPair {
@@ -34,7 +39,7 @@ pub const IdentityKeyStore = struct {
         return self.vtable.getLocalRegistrationId(self.ptr);
     }
 
-    pub fn saveIdentity(self: IdentityKeyStore, addr: *const address.ProtocolAddress, key: identity.IdentityKey) !bool {
+    pub fn saveIdentity(self: IdentityKeyStore, addr: *const address.ProtocolAddress, key: identity.IdentityKey) !IdentityChange {
         return self.vtable.saveIdentity(self.ptr, addr, key);
     }
 
@@ -133,21 +138,41 @@ pub const KyberPreKeyStore = struct {
     }
 };
 
-// Sender Key Store
+// Sender Key Store.
+// Keyed by (sender ProtocolAddress, distribution_id [16]u8) — the UUID that identifies
+// a specific sender-key session (group + sender combination).
 pub const SenderKeyStore = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        storeSenderKey: *const fn (ptr: *anyopaque, sender_key_name: *const address.SenderKeyName, record: []const u8) anyerror!void,
-        loadSenderKey: *const fn (ptr: *anyopaque, sender_key_name: *const address.SenderKeyName) anyerror!?[]u8,
+        storeSenderKey: *const fn (
+            ptr: *anyopaque,
+            sender: *const address.ProtocolAddress,
+            distribution_id: [16]u8,
+            record: []const u8,
+        ) anyerror!void,
+        loadSenderKey: *const fn (
+            ptr: *anyopaque,
+            sender: *const address.ProtocolAddress,
+            distribution_id: [16]u8,
+        ) anyerror!?[]u8,
     };
 
-    pub fn storeSenderKey(self: SenderKeyStore, name: *const address.SenderKeyName, record: []const u8) !void {
-        return self.vtable.storeSenderKey(self.ptr, name, record);
+    pub fn storeSenderKey(
+        self: SenderKeyStore,
+        sender: *const address.ProtocolAddress,
+        distribution_id: [16]u8,
+        record: []const u8,
+    ) !void {
+        return self.vtable.storeSenderKey(self.ptr, sender, distribution_id, record);
     }
 
-    pub fn loadSenderKey(self: SenderKeyStore, name: *const address.SenderKeyName) !?[]u8 {
-        return self.vtable.loadSenderKey(self.ptr, name);
+    pub fn loadSenderKey(
+        self: SenderKeyStore,
+        sender: *const address.ProtocolAddress,
+        distribution_id: [16]u8,
+    ) !?[]u8 {
+        return self.vtable.loadSenderKey(self.ptr, sender, distribution_id);
     }
 };
