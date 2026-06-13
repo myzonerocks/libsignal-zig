@@ -42,6 +42,8 @@ const MemIdentityStore = struct {
     }
 
     fn deinit(self: *MemIdentityStore) void {
+        var it = self.trusted.iterator();
+        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.trusted.deinit();
     }
 
@@ -57,9 +59,12 @@ const MemIdentityStore = struct {
         const self: *MemIdentityStore = @ptrCast(@alignCast(ptr));
         const key_str = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ addr.name, addr.device_id });
         defer self.allocator.free(key_str);
-        const existed = self.trusted.contains(key_str);
-        try self.trusted.put(try self.allocator.dupe(u8, key_str), key);
-        return if (existed) .replaced_existing else .new_or_unchanged;
+        const res = try self.trusted.getOrPut(key_str);
+        if (!res.found_existing) {
+            res.key_ptr.* = try self.allocator.dupe(u8, key_str);
+        }
+        res.value_ptr.* = key;
+        return if (res.found_existing) .replaced_existing else .new_or_unchanged;
     }
     fn isTrustedIdentity(_: *anyopaque, _: *const address.ProtocolAddress, _: identity.IdentityKey, _: storage.Direction) anyerror!bool {
         return true; // trust all for tests

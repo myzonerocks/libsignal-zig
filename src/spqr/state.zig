@@ -192,12 +192,11 @@ pub const StateMachine = union(StateTag) {
             .hdr_sending => |*s| {
                 if (s.hdr_enc.idx * poly.CHUNK_SIZE >= s.hdr_enc.msg.len) {
                     // Header fully sent; pivot to EK. First EK chunk carries MAC.
-                    var old_enc = s.hdr_enc;
-                    old_enc.deinit();
                     const ek_copy = s.ek;
                     const dk_copy = s.dk;
                     const ct1_dec_copy = s.ct1_dec;
                     var ek_enc = try poly.PolyEncoder.init(allocator, &ek_copy);
+                    s.hdr_enc.deinit();
                     const c = ek_enc.nextChunk(); // index 0
                     const mac = auth.macCt(ep, &ek_copy);
                     self.* = StateMachine{ .ek_sending = .{
@@ -218,12 +217,12 @@ pub const StateMachine = union(StateTag) {
                 if (s.ek_enc.idx * poly.CHUNK_SIZE >= s.ek_enc.msg.len) {
                     const ek_copy = s.ek;
                     const dk_copy = s.dk;
-                    var old_enc = s.ek_enc;
-                    old_enc.deinit();
+                    const ct2_dec = try poly.PolyDecoder.init(mlkem.CT2_SIZE);
+                    s.ek_enc.deinit();
                     self.* = StateMachine{ .waiting_ct2 = .{
                         .dk = dk_copy,
                         .ct1 = null,
-                        .ct2_dec = try poly.PolyDecoder.init(mlkem.CT2_SIZE),
+                        .ct2_dec = ct2_dec,
                         .ct1_dec = s.ct1_dec,
                         .ek = ek_copy,
                     } };
@@ -236,12 +235,12 @@ pub const StateMachine = union(StateTag) {
                 const payload = msg_mod.Payload{ .ek_ct1_ack = .{ .index = c.index, .data = c.data } };
                 if (s.ek_enc.idx * poly.CHUNK_SIZE >= s.ek_enc.msg.len) {
                     const ct1_copy = s.ct1;
-                    var old_enc = s.ek_enc;
-                    old_enc.deinit();
+                    const ct2_dec = try poly.PolyDecoder.init(mlkem.CT2_SIZE);
+                    s.ek_enc.deinit();
                     self.* = StateMachine{ .waiting_ct2 = .{
                         .dk = s.dk,
                         .ct1 = ct1_copy,
-                        .ct2_dec = try poly.PolyDecoder.init(mlkem.CT2_SIZE),
+                        .ct2_dec = ct2_dec,
                         .ct1_dec = null,
                         .ek = s.ek,
                     } };
@@ -257,9 +256,8 @@ pub const StateMachine = union(StateTag) {
                 if (s.full_ek) |ek| {
                     // EK fully received; compute CT2 and transition. First CT2 chunk carries MAC.
                     const ct2 = mlkem.encaps2(&ek, &s.es);
-                    var old_enc = s.ct1_enc;
-                    old_enc.deinit();
                     var ct2_enc = try poly.PolyEncoder.init(allocator, &ct2);
+                    s.ct1_enc.deinit();
                     const c = ct2_enc.nextChunk(); // index 0
                     const mac = auth.macCt(ep, &ct2);
                     const ss_copy = s.ss;
@@ -552,6 +550,10 @@ pub const StateMachine = union(StateTag) {
                 const dk = data[pos..][0..2400].*;
                 pos += 2400;
                 const enc_r = try poly.deserializeEncoder(allocator, data[pos..]);
+                errdefer {
+                    var enc = enc_r.enc;
+                    enc.deinit();
+                }
                 pos += enc_r.consumed;
                 const dec_r = try poly.PolyDecoder.deserialize(data[pos..]);
                 return StateMachine{ .hdr_sending = .{
@@ -569,6 +571,10 @@ pub const StateMachine = union(StateTag) {
                 const dk = data[pos..][0..2400].*;
                 pos += 2400;
                 const enc_r = try poly.deserializeEncoder(allocator, data[pos..]);
+                errdefer {
+                    var enc = enc_r.enc;
+                    enc.deinit();
+                }
                 pos += enc_r.consumed;
                 const dec_r = try poly.PolyDecoder.deserialize(data[pos..]);
                 pos += dec_r.consumed;
@@ -588,6 +594,10 @@ pub const StateMachine = union(StateTag) {
                 const dk = data[pos..][0..2400].*;
                 pos += 2400;
                 const enc_r = try poly.deserializeEncoder(allocator, data[pos..]);
+                errdefer {
+                    var enc = enc_r.enc;
+                    enc.deinit();
+                }
                 pos += enc_r.consumed;
                 if (pos + 960 > data.len) return error.TooShort;
                 const ct1 = data[pos..][0..960].*;
@@ -643,6 +653,10 @@ pub const StateMachine = union(StateTag) {
             },
             .ct1_sending => {
                 const enc_r = try poly.deserializeEncoder(allocator, data[pos..]);
+                errdefer {
+                    var enc = enc_r.enc;
+                    enc.deinit();
+                }
                 pos += enc_r.consumed;
                 const ek_dec_r = try poly.PolyDecoder.deserialize(data[pos..]);
                 pos += ek_dec_r.consumed;
@@ -675,6 +689,10 @@ pub const StateMachine = union(StateTag) {
             },
             .ct2_sending => {
                 const enc_r = try poly.deserializeEncoder(allocator, data[pos..]);
+                errdefer {
+                    var enc = enc_r.enc;
+                    enc.deinit();
+                }
                 pos += enc_r.consumed;
                 if (pos + 32 + 8 > data.len) return error.TooShort;
                 const ss = data[pos..][0..32].*;

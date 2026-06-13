@@ -108,9 +108,8 @@ pub const PreKeySignalMessage = struct {
         const msg_copy = try allocator.dupe(u8, msg);
         errdefer allocator.free(msg_copy);
 
-        const kc_copy = if (kc_bytes) |kc| blk: {
-            break :blk try allocator.dupe(u8, kc);
-        } else null;
+        const kc_copy: ?[]const u8 = if (kc_bytes) |kc| try allocator.dupe(u8, kc) else null;
+        errdefer if (kc_copy) |kc| allocator.free(kc);
 
         return .{
             .message_version = message_version,

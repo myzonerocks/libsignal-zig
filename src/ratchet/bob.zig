@@ -26,7 +26,7 @@ pub const DerivedKeys = struct {
 
 /// Perform X3DH/PQXDH key agreement from Bob's perspective.
 pub fn initialize(
-    _: mem.Allocator,
+    allocator: mem.Allocator,
     params: BobSignalProtocolParameters,
 ) !DerivedKeys {
     const DISCONTINUITY: [32]u8 = [_]u8{0xFF} ** 32;
@@ -44,7 +44,6 @@ pub fn initialize(
         params.their_base_key,
     );
 
-    const allocator = std.heap.smp_allocator;
     var secret: std.ArrayList(u8) = .empty;
     defer secret.deinit(allocator);
     try secret.appendSlice(allocator, &DISCONTINUITY);
