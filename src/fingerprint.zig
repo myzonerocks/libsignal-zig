@@ -49,7 +49,7 @@ pub const DisplayableFingerprint = struct {
 
     /// Constant-time comparison to prevent timing attacks during key verification.
     pub fn eql(self: DisplayableFingerprint, other: DisplayableFingerprint) bool {
-        return std.crypto.utils.timingSafeEql([60]u8, self.displayable, other.displayable);
+        return std.crypto.timing_safe.eql([60]u8, self.displayable, other.displayable);
     }
 
     pub fn format(
@@ -72,9 +72,13 @@ fn computeDisplayableRaw(
 ) DisplayableFingerprint {
     const local_hash = hashForDisplay(local_key_bytes, local_stable_id);
     const remote_hash = hashForDisplay(remote_key_bytes, remote_stable_id);
+    // Sort both halves so both parties produce the same displayable string
+    // regardless of which key is "local" vs "remote".
+    const first = if (mem.lessThan(u8, &local_hash, &remote_hash)) local_hash else remote_hash;
+    const second = if (mem.lessThan(u8, &local_hash, &remote_hash)) remote_hash else local_hash;
     var result: [60]u8 = undefined;
     var out_pos: usize = 0;
-    for ([2][30]u8{ local_hash, remote_hash }) |hash| {
+    for ([2][30]u8{ first, second }) |hash| {
         var i: usize = 0;
         while (i + 5 <= 30) : (i += 5) {
             var val: u64 = 0;

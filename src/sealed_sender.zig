@@ -428,7 +428,7 @@ pub fn sealedSenderEncrypt(
 
     const sc_bytes = try usmc.sender_cert.serialize();
     defer allocator.free(sc_bytes);
-    var static_pt = std.ArrayListUnmanaged(u8){};
+    var static_pt: std.ArrayListUnmanaged(u8) = .empty;
     defer static_pt.deinit(allocator);
     try static_pt.appendSlice(allocator, sc_bytes);
     try static_pt.appendSlice(allocator, e_ciphertext);
@@ -604,7 +604,7 @@ pub fn sealedSenderEncryptV2(
     e_priv_bytes[31] |= 64;
 
     const e_priv = curve.PrivateKey.fromBytes(e_priv_bytes);
-    const e_pub_bytes = e_priv.publicKey().key_bytes;
+    const e_pub_bytes = (try e_priv.publicKey()).key_bytes;
 
     var K: [32]u8 = undefined;
     hkdfV2(&m, LABEL_K, &K);
@@ -619,7 +619,7 @@ pub fn sealedSenderEncryptV2(
     // Step 3: per-recipient C_i and AT_i
     const total_recipients = recipients.len + excluded.len;
 
-    var out = std.ArrayListUnmanaged(u8){};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
 
     try out.append(allocator, SSV2_SENT_VERSION);
@@ -677,14 +677,14 @@ pub fn sealedSenderDecryptV2(
     if (received.len < 1 + C_LEN + AT_LEN + E_PUB_LEN + 16)
         return err.SignalError.InvalidMessage;
     if (received[0] != SSV2_RECV_VERSION)
-        return err.SignalError.InvalidVersion;
+        return err.SignalError.UnknownCiphertextVersion;
 
     var pos: usize = 1;
-    const c: [32]u8 = received[pos .. pos + 32].*;
+    const c: [32]u8 = received[pos..][0..32].*;
     pos += 32;
-    const at: [16]u8 = received[pos .. pos + 16].*;
+    const at: [16]u8 = received[pos..][0..16].*;
     pos += 16;
-    const e_pub_bytes: [32]u8 = received[pos .. pos + 32].*;
+    const e_pub_bytes: [32]u8 = received[pos..][0..32].*;
     pos += 32;
     const ciphertext_with_tag = received[pos..];
 
@@ -709,7 +709,7 @@ pub fn sealedSenderDecryptV2(
     e_derived[0] &= 248;
     e_derived[31] &= 127;
     e_derived[31] |= 64;
-    const derived_pub = curve.PrivateKey.fromBytes(e_derived).publicKey().key_bytes;
+    const derived_pub = (try curve.PrivateKey.fromBytes(e_derived).publicKey()).key_bytes;
     if (!mem.eql(u8, &derived_pub, &e_pub_bytes))
         return err.SignalError.InvalidMessage;
 
@@ -731,7 +731,7 @@ pub fn sealedSenderDecryptV2(
     var expected_at: [AT_LEN]u8 = undefined;
     hkdfV2(&ikm_s, LABEL_DH_S, &expected_at);
 
-    if (!std.crypto.utils.timingSafeEql([AT_LEN]u8, at, expected_at)) {
+    if (!std.crypto.timing_safe.eql([AT_LEN]u8, at, expected_at)) {
         allocator.free(plaintext);
         return err.SignalError.InvalidMessage;
     }

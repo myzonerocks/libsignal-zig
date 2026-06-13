@@ -152,7 +152,7 @@ pub const Validating = struct {
         var actual: [MAC_LEN]u8 = undefined;
         HmacSha256.create(&actual, self.buf[0..self.chunk_size], &self.key);
 
-        if (!std.crypto.utils.timingSafeEql([MAC_LEN]u8, actual, expected))
+        if (!std.crypto.timing_safe.eql([MAC_LEN]u8, actual, expected))
             return err.SignalError.InvalidMessage;
 
         self.buf_len = 0;

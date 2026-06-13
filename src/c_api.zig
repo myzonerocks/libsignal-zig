@@ -16,6 +16,14 @@ const session_record_mod = @import("state/session_record.zig");
 const pre_key_record_mod = @import("state/pre_key_record.zig");
 const signed_pre_key_record_mod = @import("state/signed_pre_key_record.zig");
 const kyber_pre_key_record_mod = @import("state/kyber_pre_key_record.zig");
+const group_session_builder_mod = @import("group_session_builder.zig");
+const group_cipher_mod = @import("group_cipher.zig");
+const sealed_sender_mod = @import("sealed_sender.zig");
+const fingerprint_mod = @import("fingerprint.zig");
+const username_mod = @import("username.zig");
+const account_keys_mod = @import("account_keys.zig");
+const service_id_mod = @import("service_id.zig");
+const skdm_mod = @import("messages/sender_key_distribution_message.zig");
 const err = @import("error.zig");
 
 const gpa = std.heap.c_allocator;
@@ -573,4 +581,715 @@ fn decryptInner(ctx: *LibsignalCtx, ct: []const u8) ![]u8 {
         if (ctx.kyber_adapter != null) ctx.kyber_adapter.?.store() else null,
     );
     return cipher.decryptMessage(ct);
+}
+
+// ── Group messaging ───────────────────────────────────────────────────────────
+//
+// CSenderKeyStore callbacks: store/load keyed by (name_z, device_id, dist_id[16]).
+// load returns -6 when no record exists (not found), 0 on success.
+// Heap-allocated output from load must have been allocated with malloc.
+
+pub const CSenderKeyStore = extern struct {
+    ud: ?*anyopaque,
+    store: ?*const fn (?*anyopaque, [*:0]const u8, u32, *const [16]u8, [*]const u8, usize) callconv(.c) c_int,
+    load: ?*const fn (?*anyopaque, [*:0]const u8, u32, *const [16]u8, *?[*]u8, *usize) callconv(.c) c_int,
+};
+
+const SenderKeyStoreAdapter = struct {
+    c: CSenderKeyStore,
+
+    fn storeSenderKey(ptr: *anyopaque, sender: *const address_mod.ProtocolAddress, dist_id: [16]u8, record: []const u8) anyerror!void {
+        const self: *SenderKeyStoreAdapter = @ptrCast(@alignCast(ptr));
+        const f = self.c.store orelse return error.NotImplemented;
+        const name_z = try gpa.dupeZ(u8, sender.name);
+        defer gpa.free(name_z);
+        if (f(self.c.ud, name_z, sender.device_id, &dist_id, record.ptr, record.len) != 0)
+            return error.StoreError;
+    }
+
+    fn loadSenderKey(ptr: *anyopaque, sender: *const address_mod.ProtocolAddress, dist_id: [16]u8) anyerror!?[]u8 {
+        const self: *SenderKeyStoreAdapter = @ptrCast(@alignCast(ptr));
+        const f = self.c.load orelse return null;
+        const name_z = try gpa.dupeZ(u8, sender.name);
+        defer gpa.free(name_z);
+        var out_ptr: ?[*]u8 = null;
+        var out_len: usize = 0;
+        const rc = f(self.c.ud, name_z, sender.device_id, &dist_id, &out_ptr, &out_len);
+        if (rc == -6) return null;
+        if (rc != 0) return error.StoreError;
+        const data = out_ptr.?[0..out_len];
+        defer std.c.free(out_ptr);
+        return try gpa.dupe(u8, data);
+    }
+
+    const vtable = storage.SenderKeyStore.VTable{
+        .storeSenderKey = storeSenderKey,
+        .loadSenderKey = loadSenderKey,
+    };
+
+    fn store(self: *SenderKeyStoreAdapter) storage.SenderKeyStore {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+/// Create (or retrieve existing) sender key session, returning a serialized
+/// SenderKeyDistributionMessage the caller must distribute to group members.
+/// distribution_id: 16-byte UUID identifying this group session.
+export fn libsignal_group_create_session(
+    sender_name: [*:0]const u8,
+    sender_device_id: u32,
+    distribution_id: *const [16]u8,
+    sk_store: CSenderKeyStore,
+    skdm_out: *?[*]u8,
+    skdm_len_out: *usize,
+) c_int {
+    const result = groupCreateSessionInner(sender_name, sender_device_id, distribution_id.*, sk_store) catch |e| return toErrCode(e);
+    skdm_out.* = result.ptr;
+    skdm_len_out.* = result.len;
+    return 0;
+}
+
+fn groupCreateSessionInner(
+    sender_name: [*:0]const u8,
+    sender_device_id: u32,
+    distribution_id: [16]u8,
+    c_store: CSenderKeyStore,
+) ![]u8 {
+    var adapter = SenderKeyStoreAdapter{ .c = c_store };
+    var builder = group_session_builder_mod.GroupSessionBuilder.init(gpa, adapter.store());
+    const name_slice = std.mem.span(sender_name);
+    const sender = address_mod.ProtocolAddress{ .name = name_slice, .device_id = sender_device_id };
+    var skdm = try builder.createSession(&sender, distribution_id);
+    defer skdm.deinit();
+    return skdm.serialize();
+}
+
+/// Process a received SenderKeyDistributionMessage from a group member.
+/// skdm_bytes: serialized SenderKeyDistributionMessage.
+export fn libsignal_group_process_session(
+    sender_name: [*:0]const u8,
+    sender_device_id: u32,
+    skdm_bytes: [*]const u8,
+    skdm_len: usize,
+    sk_store: CSenderKeyStore,
+) c_int {
+    groupProcessSessionInner(sender_name, sender_device_id, skdm_bytes[0..skdm_len], sk_store) catch |e| return toErrCode(e);
+    return 0;
+}
+
+fn groupProcessSessionInner(
+    sender_name: [*:0]const u8,
+    sender_device_id: u32,
+    skdm_bytes: []const u8,
+    c_store: CSenderKeyStore,
+) !void {
+    var adapter = SenderKeyStoreAdapter{ .c = c_store };
+    var builder = group_session_builder_mod.GroupSessionBuilder.init(gpa, adapter.store());
+    const name_slice = std.mem.span(sender_name);
+    const sender = address_mod.ProtocolAddress{ .name = name_slice, .device_id = sender_device_id };
+    var skdm = try skdm_mod.SenderKeyDistributionMessage.deserialize(gpa, skdm_bytes);
+    defer skdm.deinit();
+    try builder.processSession(&sender, &skdm);
+}
+
+/// Encrypt a group message. Returns the serialized SenderKeyMessage.
+export fn libsignal_group_encrypt(
+    sender_name: [*:0]const u8,
+    sender_device_id: u32,
+    distribution_id: *const [16]u8,
+    plaintext: [*]const u8,
+    plaintext_len: usize,
+    sk_store: CSenderKeyStore,
+    ct_out: *?[*]u8,
+    ct_len_out: *usize,
+) c_int {
+    const ct = groupEncryptInner(sender_name, sender_device_id, distribution_id.*, plaintext[0..plaintext_len], sk_store) catch |e| return toErrCode(e);
+    ct_out.* = ct.ptr;
+    ct_len_out.* = ct.len;
+    return 0;
+}
+
+fn groupEncryptInner(
+    sender_name: [*:0]const u8,
+    sender_device_id: u32,
+    distribution_id: [16]u8,
+    plaintext: []const u8,
+    c_store: CSenderKeyStore,
+) ![]u8 {
+    var adapter = SenderKeyStoreAdapter{ .c = c_store };
+    const name_slice = std.mem.span(sender_name);
+    const sender = address_mod.ProtocolAddress{ .name = name_slice, .device_id = sender_device_id };
+    var cipher = group_cipher_mod.GroupCipher.init(gpa, adapter.store(), sender, distribution_id);
+    return cipher.encrypt(plaintext);
+}
+
+/// Decrypt a group message (SenderKeyMessage). Returns the plaintext.
+export fn libsignal_group_decrypt(
+    sender_name: [*:0]const u8,
+    sender_device_id: u32,
+    distribution_id: *const [16]u8,
+    ciphertext: [*]const u8,
+    ciphertext_len: usize,
+    sk_store: CSenderKeyStore,
+    pt_out: *?[*]u8,
+    pt_len_out: *usize,
+) c_int {
+    const pt = groupDecryptInner(sender_name, sender_device_id, distribution_id.*, ciphertext[0..ciphertext_len], sk_store) catch |e| return toErrCode(e);
+    pt_out.* = pt.ptr;
+    pt_len_out.* = pt.len;
+    return 0;
+}
+
+fn groupDecryptInner(
+    sender_name: [*:0]const u8,
+    sender_device_id: u32,
+    distribution_id: [16]u8,
+    ciphertext: []const u8,
+    c_store: CSenderKeyStore,
+) ![]u8 {
+    var adapter = SenderKeyStoreAdapter{ .c = c_store };
+    const name_slice = std.mem.span(sender_name);
+    const sender = address_mod.ProtocolAddress{ .name = name_slice, .device_id = sender_device_id };
+    var cipher = group_cipher_mod.GroupCipher.init(gpa, adapter.store(), sender, distribution_id);
+    return cipher.decrypt(ciphertext);
+}
+
+// ── Sealed sender ─────────────────────────────────────────────────────────────
+
+/// Build and serialize a ServerCertificate.
+/// trust_root_priv: 32-byte private key of the server's trust root.
+/// Returns heap-allocated serialized bytes; caller must free().
+export fn libsignal_server_cert_serialize(
+    key_id: u32,
+    key_pub: *const [33]u8,
+    trust_root_priv: *const [32]u8,
+    out: *?[*]u8,
+    out_len: *usize,
+) c_int {
+    const result = serverCertSerializeInner(key_id, key_pub, trust_root_priv) catch |e| return toErrCode(e);
+    out.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+fn serverCertSerializeInner(key_id: u32, key_pub: *const [33]u8, trust_root_priv: *const [32]u8) ![]u8 {
+    const pk = try curve.PublicKey.deserialize(key_pub);
+    const sk = curve.PrivateKey{ .key_bytes = trust_root_priv.* };
+    var sc = try sealed_sender_mod.ServerCertificate.new(gpa, key_id, pk, sk);
+    defer sc.deinit();
+    return sc.serialize();
+}
+
+/// Build and serialize a SenderCertificate.
+/// sender_e164_z: null-terminated E.164 string, or null if absent.
+/// server_key_priv: 32-byte private key used to sign the sender certificate.
+/// Returns heap-allocated serialized bytes; caller must free().
+export fn libsignal_sender_cert_serialize(
+    sender_uuid_z: [*:0]const u8,
+    sender_e164_z: ?[*:0]const u8,
+    sender_device_id: u32,
+    sender_key_pub: *const [33]u8,
+    expiration: u64,
+    server_cert_bytes: [*]const u8,
+    server_cert_len: usize,
+    server_key_priv: *const [32]u8,
+    out: *?[*]u8,
+    out_len: *usize,
+) c_int {
+    const result = senderCertSerializeInner(
+        sender_uuid_z,
+        sender_e164_z,
+        sender_device_id,
+        sender_key_pub,
+        expiration,
+        server_cert_bytes[0..server_cert_len],
+        server_key_priv,
+    ) catch |e| return toErrCode(e);
+    out.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+fn senderCertSerializeInner(
+    sender_uuid_z: [*:0]const u8,
+    sender_e164_z: ?[*:0]const u8,
+    sender_device_id: u32,
+    sender_key_pub: *const [33]u8,
+    expiration: u64,
+    server_cert_bytes: []const u8,
+    server_key_priv: *const [32]u8,
+) ![]u8 {
+    const sender_key = try curve.PublicKey.deserialize(sender_key_pub);
+    const server_key = curve.PrivateKey{ .key_bytes = server_key_priv.* };
+    var server_cert = try sealed_sender_mod.ServerCertificate.deserialize(gpa, server_cert_bytes);
+    // errdefer only: on success, ownership transfers to sc.signer; sc.deinit() handles cleanup.
+    errdefer server_cert.deinit();
+    var sc = try sealed_sender_mod.SenderCertificate.new(
+        gpa,
+        std.mem.span(sender_uuid_z),
+        if (sender_e164_z) |e| std.mem.span(e) else null,
+        sender_device_id,
+        sender_key,
+        expiration,
+        server_cert,
+        server_key,
+    );
+    defer sc.deinit();
+    return sc.serialize();
+}
+
+/// V1 sealed sender encrypt.
+/// group_id_z: null-terminated group ID string, or null.
+/// Returns heap-allocated ciphertext; caller must free().
+export fn libsignal_sealed_sender_encrypt(
+    recipient_pub: *const [33]u8,
+    sender_cert_bytes: [*]const u8,
+    sender_cert_len: usize,
+    msg_type: u8,
+    content_hint: u8,
+    group_id_z: ?[*:0]const u8,
+    plaintext: [*]const u8,
+    plaintext_len: usize,
+    out: *?[*]u8,
+    out_len: *usize,
+) c_int {
+    const result = sealedSenderEncryptInner(
+        recipient_pub,
+        sender_cert_bytes[0..sender_cert_len],
+        msg_type,
+        content_hint,
+        group_id_z,
+        plaintext[0..plaintext_len],
+    ) catch |e| return toErrCode(e);
+    out.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+fn sealedSenderEncryptInner(
+    recipient_pub: *const [33]u8,
+    sender_cert_bytes: []const u8,
+    msg_type: u8,
+    content_hint: u8,
+    group_id_z: ?[*:0]const u8,
+    plaintext: []const u8,
+) ![]u8 {
+    const r_pub = try curve.PublicKey.deserialize(recipient_pub);
+    var sc = try sealed_sender_mod.SenderCertificate.deserialize(gpa, sender_cert_bytes);
+    // errdefer only: on success, ownership transfers to usmc.sender_cert; usmc.deinit() handles cleanup.
+    errdefer sc.deinit();
+    const ct: sealed_sender_mod.ContentType = @enumFromInt(msg_type);
+    const ch: sealed_sender_mod.ContentHint = @enumFromInt(content_hint);
+    const gid: ?[]const u8 = if (group_id_z) |g| std.mem.span(g) else null;
+    var usmc = try sealed_sender_mod.UnidentifiedSenderMessageContent.new(gpa, ct, sc, ch, gid, plaintext);
+    defer usmc.deinit();
+    return sealed_sender_mod.sealedSenderEncrypt(gpa, r_pub, &usmc);
+}
+
+/// V1 sealed sender decrypt. Outputs sender_uuid, sender_e164 (may be null),
+/// sender_device_id, content_type, and contents as separate heap-allocated values.
+/// Caller must free: sender_uuid_out, sender_e164_out (if non-null), contents_out.
+export fn libsignal_sealed_sender_decrypt(
+    data: [*]const u8,
+    data_len: usize,
+    our_priv: *const [32]u8,
+    sender_uuid_out: *?[*]u8,
+    sender_uuid_len_out: *usize,
+    sender_e164_out: *?[*]u8,
+    sender_e164_len_out: *usize,
+    sender_device_id_out: *u32,
+    content_type_out: *u8,
+    contents_out: *?[*]u8,
+    contents_len_out: *usize,
+) c_int {
+    sealedSenderDecryptInner(
+        data[0..data_len],
+        our_priv,
+        sender_uuid_out,
+        sender_uuid_len_out,
+        sender_e164_out,
+        sender_e164_len_out,
+        sender_device_id_out,
+        content_type_out,
+        contents_out,
+        contents_len_out,
+    ) catch |e| return toErrCode(e);
+    return 0;
+}
+
+fn sealedSenderDecryptInner(
+    data: []const u8,
+    our_priv: *const [32]u8,
+    sender_uuid_out: *?[*]u8,
+    sender_uuid_len_out: *usize,
+    sender_e164_out: *?[*]u8,
+    sender_e164_len_out: *usize,
+    sender_device_id_out: *u32,
+    content_type_out: *u8,
+    contents_out: *?[*]u8,
+    contents_len_out: *usize,
+) !void {
+    const sk = curve.PrivateKey{ .key_bytes = our_priv.* };
+    var usmc = try sealed_sender_mod.sealedSenderDecryptToUsmc(gpa, data, sk);
+    defer usmc.deinit();
+
+    const uuid = try gpa.dupe(u8, usmc.sender_cert.sender_uuid);
+    errdefer gpa.free(uuid);
+    const e164: ?[]u8 = if (usmc.sender_cert.sender_e164) |e| try gpa.dupe(u8, e) else null;
+    errdefer if (e164) |e| gpa.free(e);
+    const contents = try gpa.dupe(u8, usmc.contents);
+
+    sender_uuid_out.* = uuid.ptr;
+    sender_uuid_len_out.* = uuid.len;
+    sender_e164_out.* = if (e164) |e| e.ptr else null;
+    sender_e164_len_out.* = if (e164) |e| e.len else 0;
+    sender_device_id_out.* = usmc.sender_cert.sender_device_id;
+    content_type_out.* = @intFromEnum(usmc.msg_type);
+    contents_out.* = contents.ptr;
+    contents_len_out.* = contents.len;
+}
+
+/// V2 sealed sender recipient descriptor (C-compatible layout).
+pub const CSealedSenderV2Recipient = extern struct {
+    service_id_fixed: [17]u8, // ServiceId fixed-width binary (type_byte || uuid[16])
+    device_id: u8,
+    identity_pub: [33]u8,
+};
+
+/// V2 sealed sender encrypt (multi-recipient AES-256-GCM-SIV).
+/// excluded_sids: array of fixed-width ServiceId bytes (17 bytes each), or null.
+/// Returns heap-allocated sent-message bytes (version 0x23); caller must free().
+export fn libsignal_sealed_sender_encrypt_v2(
+    message: [*]const u8,
+    message_len: usize,
+    sender_priv: *const [32]u8,
+    sender_pub: *const [33]u8,
+    recipients: [*]const CSealedSenderV2Recipient,
+    recipient_count: usize,
+    excluded_sids: ?[*]const [17]u8,
+    excluded_count: usize,
+    out: *?[*]u8,
+    out_len: *usize,
+) c_int {
+    const result = sealedSenderEncryptV2Inner(
+        message[0..message_len],
+        sender_priv,
+        sender_pub,
+        recipients[0..recipient_count],
+        if (excluded_sids) |e| e[0..excluded_count] else &.{},
+    ) catch |e| return toErrCode(e);
+    out.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+fn sealedSenderEncryptV2Inner(
+    message: []const u8,
+    sender_priv: *const [32]u8,
+    sender_pub: *const [33]u8,
+    c_recipients: []const CSealedSenderV2Recipient,
+    c_excluded: []const [17]u8,
+) ![]u8 {
+    const s_priv = curve.PrivateKey{ .key_bytes = sender_priv.* };
+    const s_pub = try curve.PublicKey.deserialize(sender_pub);
+    const sender_kp = curve.KeyPair{ .private_key = s_priv, .public_key = s_pub };
+
+    const recipients = try gpa.alloc(sealed_sender_mod.SealedSenderV2Recipient, c_recipients.len);
+    defer gpa.free(recipients);
+    for (c_recipients, 0..) |cr, i| {
+        recipients[i] = .{
+            .service_id = try service_id_mod.ServiceId.fromFixedWidthBinary(cr.service_id_fixed),
+            .device_id = cr.device_id,
+            .identity_key = try curve.PublicKey.deserialize(&cr.identity_pub),
+        };
+    }
+
+    const excluded = try gpa.alloc(service_id_mod.ServiceId, c_excluded.len);
+    defer gpa.free(excluded);
+    for (c_excluded, 0..) |e, i| {
+        excluded[i] = try service_id_mod.ServiceId.fromFixedWidthBinary(e);
+    }
+
+    return sealed_sender_mod.sealedSenderEncryptV2(gpa, message, sender_kp, recipients, excluded);
+}
+
+// Per-recipient entry sizes in the sent (0x23) format:
+//   service_id[17] + device_id[1] + reg_id/has_more[2] + C[32] + AT[16] = 68 bytes
+const V2_SENT_ENTRY_LEN: usize = 17 + 1 + 2 + 32 + 16;
+
+/// Convert a V2 "sent message" (version 0x23) into the per-device "received message"
+/// (version 0x22) for the first recipient whose (service_id, device_id) matches.
+/// This models the Signal server's per-recipient dispatch step.
+/// Returns heap-allocated received message bytes (0x22 format); caller must free().
+export fn libsignal_sealed_sender_v2_dispatch(
+    sent: [*]const u8,
+    sent_len: usize,
+    service_id_fixed: *const [17]u8,
+    device_id: u8,
+    out: *?[*]u8,
+    out_len: *usize,
+) c_int {
+    const result = v2DispatchInner(sent[0..sent_len], service_id_fixed, device_id) catch |e| return toErrCode(e);
+    out.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+fn v2DispatchInner(sent: []const u8, service_id_fixed: *const [17]u8, target_device_id: u8) ![]u8 {
+    const SSV2_SENT: u8 = 0x23;
+    const SSV2_RECV: u8 = 0x22;
+    if (sent.len < 2) return err.SignalError.InvalidMessage;
+    if (sent[0] != SSV2_SENT) return err.SignalError.UnknownCiphertextVersion;
+
+    // Read varint recipient count
+    var pos: usize = 1;
+    var recipient_count: usize = 0;
+    var shift: u6 = 0;
+    while (pos < sent.len) {
+        const b = sent[pos];
+        pos += 1;
+        recipient_count |= @as(usize, b & 0x7F) << shift;
+        if (b & 0x80 == 0) break;
+        shift += 7;
+        if (shift >= 64) return err.SignalError.InvalidMessage;
+    }
+
+    const entries_start = pos;
+    const entries_end = entries_start + recipient_count * V2_SENT_ENTRY_LEN;
+    if (entries_end + 32 > sent.len) return err.SignalError.InvalidMessage;
+
+    // Scan entries for matching recipient
+    var found_c: ?[32]u8 = null;
+    var found_at: ?[16]u8 = null;
+    for (0..recipient_count) |i| {
+        const e = entries_start + i * V2_SENT_ENTRY_LEN;
+        const sid = sent[e .. e + 17];
+        const dev = sent[e + 17];
+        // skip 2-byte reg_id/has_more
+        const c_off = e + 20;
+        const at_off = c_off + 32;
+        if (std.mem.eql(u8, sid, service_id_fixed) and dev == target_device_id) {
+            found_c = sent[c_off .. c_off + 32][0..32].*;
+            found_at = sent[at_off .. at_off + 16][0..16].*;
+            break;
+        }
+    }
+
+    const c = found_c orelse return err.SignalError.InvalidKeyIdentifier;
+    const at = found_at orelse return err.SignalError.InvalidKeyIdentifier;
+
+    // e_pub (32 bytes) + ciphertext immediately follow the entries
+    const e_pub: [32]u8 = sent[entries_end .. entries_end + 32][0..32].*;
+    const ciphertext = sent[entries_end + 32 ..];
+
+    // Build 0x22 received message: 0x22 || C[32] || AT[16] || e_pub[32] || ciphertext
+    const recv = try gpa.alloc(u8, 1 + 32 + 16 + 32 + ciphertext.len);
+    recv[0] = SSV2_RECV;
+    @memcpy(recv[1..33], &c);
+    @memcpy(recv[33..49], &at);
+    @memcpy(recv[49..81], &e_pub);
+    @memcpy(recv[81..], ciphertext);
+    return recv;
+}
+
+/// V2 sealed sender decrypt. Returns the decrypted plaintext; caller must free().
+export fn libsignal_sealed_sender_decrypt_v2(
+    received: [*]const u8,
+    received_len: usize,
+    our_priv: *const [32]u8,
+    our_pub: *const [33]u8,
+    sender_pub: *const [33]u8,
+    out: *?[*]u8,
+    out_len: *usize,
+) c_int {
+    const result = sealedSenderDecryptV2Inner(received[0..received_len], our_priv, our_pub, sender_pub) catch |e| return toErrCode(e);
+    out.* = result.ptr;
+    out_len.* = result.len;
+    return 0;
+}
+
+fn sealedSenderDecryptV2Inner(
+    received: []const u8,
+    our_priv: *const [32]u8,
+    our_pub: *const [33]u8,
+    sender_pub: *const [33]u8,
+) ![]u8 {
+    const r_priv = curve.PrivateKey{ .key_bytes = our_priv.* };
+    const r_pub = try curve.PublicKey.deserialize(our_pub);
+    const s_pub = try curve.PublicKey.deserialize(sender_pub);
+    const our_kp = curve.KeyPair{ .private_key = r_priv, .public_key = r_pub };
+    return sealed_sender_mod.sealedSenderDecryptV2(gpa, received, our_kp, s_pub);
+}
+
+// ── Fingerprint ───────────────────────────────────────────────────────────────
+
+/// Compute a fingerprint for two identity keys.
+/// local/remote_stable_id: phone number or other stable identifier bytes.
+/// displayable_out: caller-provided [60]u8 buffer filled with the decimal digit string.
+/// scannable_out / scannable_len_out: heap-allocated serialized ScannableFingerprint; caller must free().
+export fn libsignal_fingerprint_compute(
+    local_pub: *const [33]u8,
+    local_stable_id: [*]const u8,
+    local_stable_id_len: usize,
+    remote_pub: *const [33]u8,
+    remote_stable_id: [*]const u8,
+    remote_stable_id_len: usize,
+    displayable_out: *[60]u8,
+    scannable_out: *?[*]u8,
+    scannable_len_out: *usize,
+) c_int {
+    fingerprintComputeInner(
+        local_pub,
+        local_stable_id[0..local_stable_id_len],
+        remote_pub,
+        remote_stable_id[0..remote_stable_id_len],
+        displayable_out,
+        scannable_out,
+        scannable_len_out,
+    ) catch |e| return toErrCode(e);
+    return 0;
+}
+
+fn fingerprintComputeInner(
+    local_pub: *const [33]u8,
+    local_stable_id: []const u8,
+    remote_pub: *const [33]u8,
+    remote_stable_id: []const u8,
+    displayable_out: *[60]u8,
+    scannable_out: *?[*]u8,
+    scannable_len_out: *usize,
+) !void {
+    const lk_raw = try curve.PublicKey.deserialize(local_pub);
+    const rk_raw = try curve.PublicKey.deserialize(remote_pub);
+    const local_ik = identity.IdentityKey.fromPublicKey(lk_raw);
+    const remote_ik = identity.IdentityKey.fromPublicKey(rk_raw);
+    const fp = try fingerprint_mod.Fingerprint.compute(gpa, local_ik, local_stable_id, remote_ik, remote_stable_id);
+    displayable_out.* = fp.displayable.digits();
+    const scannable_bytes = try fp.scannable.serialize();
+    scannable_out.* = scannable_bytes.ptr;
+    scannable_len_out.* = scannable_bytes.len;
+}
+
+/// Compare two serialized ScannableFingerprints.
+/// match_out: set to 1 if they match, 0 otherwise.
+export fn libsignal_fingerprint_compare(
+    local_scannable: [*]const u8,
+    local_len: usize,
+    their_scannable: [*]const u8,
+    their_len: usize,
+    match_out: *c_int,
+) c_int {
+    const fp = fingerprint_mod.ScannableFingerprint.compareTo(
+        // We need to deserialize local first — build from its bytes
+        blk: {
+            // Parse local scannable bytes to reconstruct ScannableFingerprint
+            const bytes = local_scannable[0..local_len];
+            var pos: usize = 0;
+            const proto_mod = @import("proto.zig");
+            var local_fp: [32]u8 = std.mem.zeroes([32]u8);
+            var remote_fp: [32]u8 = std.mem.zeroes([32]u8);
+            while (proto_mod.nextField(bytes, &pos) catch null) |field| {
+                switch (field.number) {
+                    2 => {
+                        if (field.wire_type == .len and field.data.len.len == 32) local_fp = field.data.len[0..32].*;
+                    },
+                    3 => {
+                        if (field.wire_type == .len and field.data.len.len == 32) remote_fp = field.data.len[0..32].*;
+                    },
+                    else => {},
+                }
+            }
+            break :blk fingerprint_mod.ScannableFingerprint{
+                .version = 0,
+                .local_fingerprint = local_fp,
+                .remote_fingerprint = remote_fp,
+                .allocator = gpa,
+            };
+        },
+        their_scannable[0..their_len],
+    ) catch |e| return toErrCode(e);
+    match_out.* = if (fp) 1 else 0;
+    return 0;
+}
+
+// ── Username ──────────────────────────────────────────────────────────────────
+
+/// Compute the 32-byte hash for a username (e.g. "alice.42").
+export fn libsignal_username_hash(
+    username_z: [*:0]const u8,
+    hash_out: *[32]u8,
+) c_int {
+    const h = username_mod.UsernameHash.compute(std.mem.span(username_z)) catch |e| return toErrCode(e);
+    hash_out.* = h.hash;
+    return 0;
+}
+
+/// Generate a 128-byte ZK proof that the caller knows the username behind hash_out.
+/// randomness: 32 bytes of caller-supplied entropy (use a CSPRNG).
+/// proof_out: caller-provided [128]u8 buffer.
+export fn libsignal_username_proof(
+    username_z: [*:0]const u8,
+    randomness: *const [32]u8,
+    proof_out: *[128]u8,
+) c_int {
+    const proof = username_mod.usernameProof(gpa, std.mem.span(username_z), randomness.*) catch |e| return toErrCode(e);
+    defer gpa.free(proof);
+    @memcpy(proof_out, proof[0..128]);
+    return 0;
+}
+
+/// Verify a 128-byte ZK proof against a username hash.
+/// valid_out: set to 1 if valid, 0 otherwise.
+export fn libsignal_username_verify(
+    username_hash: *const [32]u8,
+    proof: *const [128]u8,
+    valid_out: *c_int,
+) c_int {
+    const valid = username_mod.usernameVerify(gpa, username_hash.*, proof) catch |e| return toErrCode(e);
+    valid_out.* = if (valid) 1 else 0;
+    return 0;
+}
+
+// ── Account keys ──────────────────────────────────────────────────────────────
+
+/// Generate a fresh 64-character AccountEntropyPool.
+/// pool_out: caller-provided [64]u8 buffer (ASCII base-32 alphabet characters).
+export fn libsignal_account_entropy_pool_generate(pool_out: *[64]u8) void {
+    const pool = account_keys_mod.AccountEntropyPool.generate();
+    @memcpy(pool_out, &pool.data);
+}
+
+/// Parse and validate a 64-character AccountEntropyPool string.
+export fn libsignal_account_entropy_pool_parse(pool_str: *const [64]u8) c_int {
+    _ = account_keys_mod.AccountEntropyPool.fromString(pool_str) catch return toErrCode(err.SignalError.InvalidArgument);
+    return 0;
+}
+
+/// Derive the 32-byte SVR (Secure Value Recovery) master key from the entropy pool.
+export fn libsignal_account_entropy_derive_svr_key(
+    pool_str: *const [64]u8,
+    key_out: *[32]u8,
+) c_int {
+    const pool = account_keys_mod.AccountEntropyPool.fromString(pool_str) catch return toErrCode(err.SignalError.InvalidArgument);
+    key_out.* = pool.deriveSvrKey();
+    return 0;
+}
+
+/// Derive the 32-byte backup key from the entropy pool.
+export fn libsignal_account_entropy_derive_backup_key(
+    pool_str: *const [64]u8,
+    key_out: *[32]u8,
+) c_int {
+    const pool = account_keys_mod.AccountEntropyPool.fromString(pool_str) catch return toErrCode(err.SignalError.InvalidArgument);
+    key_out.* = pool.deriveBackupKey().bytes;
+    return 0;
+}
+
+/// Derive the 32-byte media encryption key from a backup key.
+export fn libsignal_backup_key_derive_media_key(
+    backup_key: *const [32]u8,
+    key_out: *[32]u8,
+) void {
+    const bk = account_keys_mod.BackupKey{ .bytes = backup_key.* };
+    key_out.* = bk.deriveMediaEncryptionKey();
 }
