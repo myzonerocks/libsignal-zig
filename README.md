@@ -110,7 +110,8 @@ const signal = @import("libsignal_zig");
 // Bob prepares a signed pre-key.
 const bob_ikp = try signal.KeyPair.generate();
 const spk = try signal.KeyPair.generate();
-const spk_sig = try bob_ikp.private_key.calculateSignature(&spk.public_key.serialize());
+const spk_pub_bytes = spk.public_key.serialize();
+const spk_sig = try bob_ikp.private_key.calculateSignature(&spk_pub_bytes);
 
 const bundle = signal.PreKeyBundle.new(
     bob_reg_id, device_id,
