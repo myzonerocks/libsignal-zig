@@ -173,11 +173,13 @@ pub const SenderCertificate = struct {
         defer allocator.free(sc_bytes);
         try cert_enc.writeBytesField(5, sc_bytes);
         const cert_bytes = try cert_enc.toOwnedSlice();
+        errdefer allocator.free(cert_bytes);
 
         const sig = try server_key.calculateSignature(cert_bytes);
         const uuid_copy = try allocator.dupe(u8, sender_uuid);
         errdefer allocator.free(uuid_copy);
-        const e164_copy = if (sender_e164) |e| try allocator.dupe(u8, e) else null;
+        const e164_copy: ?[]const u8 = if (sender_e164) |e| try allocator.dupe(u8, e) else null;
+        errdefer if (e164_copy) |e| allocator.free(e);
 
         return .{
             .sender_uuid = uuid_copy,
@@ -266,19 +268,26 @@ pub const SenderCertificate = struct {
 
         const uuid_str = uuid orelse return err.SignalError.InvalidArgument;
         const sender_key = try curve.PublicKey.deserialize(sender_key_bytes orelse return err.SignalError.InvalidArgument);
-        const server_cert = try ServerCertificate.deserialize(
+        var server_cert = try ServerCertificate.deserialize(
             allocator,
             server_cert_bytes orelse return err.SignalError.InvalidArgument,
         );
+        errdefer server_cert.deinit();
+
+        const uuid_copy = try allocator.dupe(u8, uuid_str);
+        errdefer allocator.free(uuid_copy);
+        const e164_copy: ?[]const u8 = if (e164) |e| try allocator.dupe(u8, e) else null;
+        errdefer if (e164_copy) |e| allocator.free(e);
+        const cert_copy = try allocator.dupe(u8, cert);
 
         return .{
-            .sender_uuid = try allocator.dupe(u8, uuid_str),
-            .sender_e164 = if (e164) |e| try allocator.dupe(u8, e) else null,
+            .sender_uuid = uuid_copy,
+            .sender_e164 = e164_copy,
             .sender_device_id = device_id,
             .sender_key = sender_key,
             .expiration = expiration,
             .signer = server_cert,
-            .certificate = try allocator.dupe(u8, cert),
+            .certificate = cert_copy,
             .signature = sig_raw[0..64].*,
             .allocator = allocator,
         };
@@ -301,12 +310,15 @@ pub const UnidentifiedSenderMessageContent = struct {
         group_id: ?[]const u8,
         contents: []const u8,
     ) !UnidentifiedSenderMessageContent {
+        const group_id_copy: ?[]const u8 = if (group_id) |g| try allocator.dupe(u8, g) else null;
+        errdefer if (group_id_copy) |g| allocator.free(g);
+        const contents_copy = try allocator.dupe(u8, contents);
         return .{
             .msg_type = msg_type,
             .sender_cert = sender_cert,
             .content_hint = content_hint,
-            .group_id = if (group_id) |g| try allocator.dupe(u8, g) else null,
-            .contents = try allocator.dupe(u8, contents),
+            .group_id = group_id_copy,
+            .contents = contents_copy,
             .allocator = allocator,
         };
     }
@@ -360,17 +372,21 @@ pub const UnidentifiedSenderMessageContent = struct {
                 else => {},
             }
         }
-        const sc = try SenderCertificate.deserialize(
+        var sc = try SenderCertificate.deserialize(
             allocator,
             sender_cert_bytes orelse return err.SignalError.InvalidArgument,
         );
+        errdefer sc.deinit();
         const ct = contents orelse return err.SignalError.InvalidArgument;
+        const group_id_copy: ?[]const u8 = if (group_id) |g| try allocator.dupe(u8, g) else null;
+        errdefer if (group_id_copy) |g| allocator.free(g);
+        const contents_copy = try allocator.dupe(u8, ct);
         return .{
             .msg_type = msg_type,
             .sender_cert = sc,
             .content_hint = content_hint,
-            .group_id = if (group_id) |g| try allocator.dupe(u8, g) else null,
-            .contents = try allocator.dupe(u8, ct),
+            .group_id = group_id_copy,
+            .contents = contents_copy,
             .allocator = allocator,
         };
     }

@@ -46,16 +46,18 @@ pub fn initialState(allocator: mem.Allocator, initial_key: [32]u8, dir: Directio
 /// Returns new state, the encoded message, and the chain key for this message.
 /// Caller is responsible for freeing result.state and result.msg.
 pub fn send(allocator: mem.Allocator, state_bytes: ?[]const u8) !SendResult {
-    const bytes = state_bytes orelse return SendResult{
-        .state = try allocator.dupe(u8, &.{}),
-        .msg = try allocator.dupe(u8, &.{}),
-        .key = null,
+    const bytes = state_bytes orelse {
+        const empty_state = try allocator.dupe(u8, &.{});
+        errdefer allocator.free(empty_state);
+        const empty_msg = try allocator.dupe(u8, &.{});
+        return SendResult{ .state = empty_state, .msg = empty_msg, .key = null };
     };
-    if (bytes.len == 0) return SendResult{
-        .state = try allocator.dupe(u8, &.{}),
-        .msg = try allocator.dupe(u8, &.{}),
-        .key = null,
-    };
+    if (bytes.len == 0) {
+        const empty_state = try allocator.dupe(u8, &.{});
+        errdefer allocator.free(empty_state);
+        const empty_msg = try allocator.dupe(u8, &.{});
+        return SendResult{ .state = empty_state, .msg = empty_msg, .key = null };
+    }
 
     var spqr_state = try state_mod.SpqrState.deserialize(allocator, bytes);
     defer spqr_state.deinit(allocator);
