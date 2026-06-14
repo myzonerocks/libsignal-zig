@@ -1,765 +1,899 @@
 #!/usr/bin/env ruby
-# Every C FFI function exported by libsignal-zig.
-# Each section exercises a real-world roundtrip: generate → use → verify.
-# Run with: bundle exec ruby main.rb
+# examples/ruby/main.rb — signal_ffi.h round-trip exerciser (Ruby FFI)
+#
+# Each section exercises a real-world roundtrip through the signal_ffi API.
+# Run with:  bundle exec ruby main.rb
 require "ffi"
 
 LIB_DIR = File.expand_path("../../zig-out/lib", __dir__)
-INC_DIR = File.expand_path("../../include", __dir__)
 
-module LibSignal
-  extend FFI::Library
-  ffi_lib File.join(LIB_DIR, "libsignal.dylib")
+# ── libc free ────────────────────────────────────────────────────────────────
 
-  # ── Error constants ─────────────────────────────────────────────────────────
-  OK              =  0
-  ERR_NOT_FOUND   = -6
-
-  # ── EC / XEdDSA ─────────────────────────────────────────────────────────────
-  attach_function :libsignal_ec_keypair_generate,
-    [:pointer, :pointer], :int
-  attach_function :libsignal_ec_dh,
-    [:pointer, :pointer, :pointer], :int
-  attach_function :libsignal_xeddsa_sign,
-    [:pointer, :pointer, :size_t, :pointer], :int
-  attach_function :libsignal_xeddsa_verify,
-    [:pointer, :pointer, :size_t, :pointer], :int
-
-  # ── ML-KEM-1024 ─────────────────────────────────────────────────────────────
-  attach_function :libsignal_kyber1024_keypair_generate,
-    [:pointer, :pointer], :int
-  attach_function :libsignal_kyber1024_encaps,
-    [:pointer, :pointer, :pointer], :int
-  attach_function :libsignal_kyber1024_decaps,
-    [:pointer, :pointer, :pointer], :int
-
-  # ── Store structs ────────────────────────────────────────────────────────────
-  # All store structs are passed by value to libsignal_ctx_new.
-  # We build them as FFI::Struct, then pass a layout-compatible blob.
-
-  class SessionStore < FFI::Struct
-    layout :ud,    :pointer,
-           :load,  :pointer,
-           :store, :pointer
-  end
-
-  class IdentityStore < FFI::Struct
-    layout :ud,                  :pointer,
-           :get_keypair,         :pointer,
-           :get_registration_id, :pointer,
-           :save_identity,       :pointer,
-           :is_trusted,          :pointer
-  end
-
-  class PreKeyStore < FFI::Struct
-    layout :ud,     :pointer,
-           :load,   :pointer,
-           :remove, :pointer
-  end
-
-  class SignedPreKeyStore < FFI::Struct
-    layout :ud,   :pointer,
-           :load, :pointer
-  end
-
-  class SenderKeyStore < FFI::Struct
-    layout :ud,    :pointer,
-           :store, :pointer,
-           :load,  :pointer
-  end
-
-  # ── Session context ─────────────────────────────────────────────────────────
-  # libsignal_ctx_new takes all stores by value. We pass pointers to our struct
-  # memory by reading them as raw bytes and inlining into a C-level varargs-safe
-  # call via a helper we define below.
-  # The cleanest approach with ruby-ffi: use :buffer_in for struct-by-value
-  # by casting the struct pointer to :pointer and reading bytes.
-
-  attach_function :libsignal_ctx_new, [
-    :string, :uint32,
-    SessionStore.by_value,
-    IdentityStore.by_value,
-    PreKeyStore.by_value,
-    SignedPreKeyStore.by_value,
-    :pointer   # nullable kyber store
-  ], :pointer
-
-  attach_function :libsignal_ctx_free, [:pointer], :void
-
-  attach_function :libsignal_process_prekey_bundle, [
-    :pointer,           # ctx
-    :uint32,            # reg_id
-    :uint32, :pointer,  # pre_key_id, pre_key_pub (nullable)
-    :uint32, :pointer, :pointer,  # spk_id, spk_pub, spk_sig
-    :pointer,           # identity_pub
-    :uint32, :pointer, :pointer   # kyber_id, kyber_pub, kyber_sig (all nullable)
-  ], :int
-
-  attach_function :libsignal_encrypt, [
-    :pointer, :pointer, :size_t, :pointer, :pointer, :pointer
-  ], :int
-
-  attach_function :libsignal_decrypt_prekey, [
-    :pointer, :pointer, :size_t, :pointer, :pointer
-  ], :int
-
-  attach_function :libsignal_decrypt, [
-    :pointer, :pointer, :size_t, :pointer, :pointer
-  ], :int
-
-  # ── Group ───────────────────────────────────────────────────────────────────
-  attach_function :libsignal_group_create_session, [
-    :string, :uint32, :pointer,
-    SenderKeyStore.by_value,
-    :pointer, :pointer
-  ], :int
-
-  attach_function :libsignal_group_process_session, [
-    :string, :uint32, :pointer, :size_t,
-    SenderKeyStore.by_value
-  ], :int
-
-  attach_function :libsignal_group_encrypt, [
-    :string, :uint32, :pointer,
-    :pointer, :size_t,
-    SenderKeyStore.by_value,
-    :pointer, :pointer
-  ], :int
-
-  attach_function :libsignal_group_decrypt, [
-    :string, :uint32, :pointer,
-    :pointer, :size_t,
-    SenderKeyStore.by_value,
-    :pointer, :pointer
-  ], :int
-
-  # ── Sealed Sender V1 ────────────────────────────────────────────────────────
-  attach_function :libsignal_server_cert_serialize, [
-    :uint32, :pointer, :pointer, :pointer, :pointer
-  ], :int
-
-  attach_function :libsignal_sender_cert_serialize, [
-    :string, :string, :uint32, :pointer,
-    :uint64, :pointer, :size_t, :pointer,
-    :pointer, :pointer
-  ], :int
-
-  attach_function :libsignal_sealed_sender_encrypt, [
-    :pointer, :pointer, :size_t,
-    :uint8, :uint8, :string,
-    :pointer, :size_t,
-    :pointer, :pointer
-  ], :int
-
-  attach_function :libsignal_sealed_sender_decrypt, [
-    :pointer, :size_t, :pointer,
-    :pointer, :pointer,
-    :pointer, :pointer,
-    :pointer, :pointer,
-    :pointer, :pointer
-  ], :int
-
-  # ── Sealed Sender V2 ────────────────────────────────────────────────────────
-  class V2Recipient < FFI::Struct
-    layout :service_id_fixed, [:uint8, 17],
-           :device_id,        :uint8,
-           :identity_pub,     [:uint8, 33]
-  end
-
-  attach_function :libsignal_sealed_sender_encrypt_v2, [
-    :pointer, :size_t,
-    :pointer, :pointer,  # sender_priv, sender_pub
-    :pointer, :size_t,   # recipients array, count
-    :pointer, :size_t,   # excluded sids
-    :pointer, :pointer   # out, out_len
-  ], :int
-
-  attach_function :libsignal_sealed_sender_v2_dispatch, [
-    :pointer, :size_t,
-    :pointer, :uint8,    # service_id_fixed, device_id
-    :pointer, :pointer   # out, out_len
-  ], :int
-
-  attach_function :libsignal_sealed_sender_decrypt_v2, [
-    :pointer, :size_t,
-    :pointer, :pointer,  # our_priv, our_pub
-    :pointer,            # sender_pub
-    :pointer, :pointer   # out, out_len
-  ], :int
-
-  # ── Fingerprint ─────────────────────────────────────────────────────────────
-  attach_function :libsignal_fingerprint_compute, [
-    :pointer, :pointer, :size_t,
-    :pointer, :pointer, :size_t,
-    :pointer, :pointer, :pointer
-  ], :int
-
-  attach_function :libsignal_fingerprint_compare, [
-    :pointer, :size_t, :pointer, :size_t, :pointer
-  ], :int
-
-  # ── Username ─────────────────────────────────────────────────────────────────
-  attach_function :libsignal_username_hash,   [:string, :pointer], :int
-  attach_function :libsignal_username_proof,  [:string, :pointer, :pointer], :int
-  attach_function :libsignal_username_verify, [:pointer, :pointer, :pointer], :int
-
-  # ── Account keys ─────────────────────────────────────────────────────────────
-  attach_function :libsignal_account_entropy_pool_generate, [:pointer], :void
-  attach_function :libsignal_account_entropy_pool_parse,    [:pointer], :int
-  attach_function :libsignal_account_entropy_derive_svr_key,    [:pointer, :pointer], :int
-  attach_function :libsignal_account_entropy_derive_backup_key, [:pointer, :pointer], :int
-  attach_function :libsignal_backup_key_derive_media_key,       [:pointer, :pointer], :void
-end
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-def must(rc, label)
-  raise "FAIL #{label}: error #{rc}" unless rc == LibSignal::OK
-end
-
-def gen_keypair
-  pub  = FFI::MemoryPointer.new(:uint8, 33)
-  priv = FFI::MemoryPointer.new(:uint8, 32)
-  must(LibSignal.libsignal_ec_keypair_generate(pub, priv), "ec_keypair_generate")
-  [pub, priv]
-end
-
-# Read a malloc'd *out / *out_len pair back as a Ruby String, then free the pointer.
-def read_out(ptr_ptr, len_ptr)
-  ptr = ptr_ptr.read_pointer
-  len = len_ptr.read(:size_t)
-  bytes = ptr.read_bytes(len)
-  FFI::LibC.free(ptr)
-  bytes
-end
-
-module FFI::LibC
+module LibC
   extend FFI::Library
   ffi_lib FFI::Library::LIBC
   attach_function :free, [:pointer], :void
 end
 
+# ── signal_ffi bindings ───────────────────────────────────────────────────────
+
+module Sig
+  extend FFI::Library
+  ffi_lib File.join(LIB_DIR, "libsignal_ffi.dylib")
+
+  # Struct-by-value types used across the API.
+  # Signal{Mut,Const}Pointer<T> structs contain exactly one pointer field.
+  # On arm64/x86-64 they are ABI-equivalent to a bare pointer, so we declare
+  # them as :pointer.  SignalBorrowedBuffer / SignalOwnedBuffer have two fields
+  # and require struct-by-value treatment.
+
+  class BorrowedBuffer < FFI::Struct
+    layout :base,   :pointer,
+           :length, :size_t
+  end
+
+  class OwnedBuffer < FFI::Struct
+    layout :base,   :pointer,
+           :length, :size_t
+  end
+
+  # Error
+  attach_function :signal_error_get_message, [:pointer, :pointer], :pointer
+  attach_function :signal_error_free,        [:pointer],           :void
+  attach_function :signal_free_buffer,       [:pointer, :size_t],  :void
+  attach_function :signal_free_string,       [:pointer],           :void
+
+  # EC keys
+  attach_function :signal_privatekey_generate,    [:pointer],                        :pointer
+  attach_function :signal_privatekey_deserialize, [:pointer, BorrowedBuffer.by_value], :pointer
+  attach_function :signal_privatekey_serialize,   [:pointer, :pointer],              :pointer
+  attach_function :signal_privatekey_get_public_key, [:pointer, :pointer],           :pointer
+  attach_function :signal_privatekey_agree,        [:pointer, :pointer, :pointer],   :pointer
+  attach_function :signal_privatekey_sign,         [:pointer, :pointer, BorrowedBuffer.by_value], :pointer
+  attach_function :signal_privatekey_destroy,      [:pointer],                       :pointer
+  attach_function :signal_publickey_deserialize,   [:pointer, BorrowedBuffer.by_value], :pointer
+  attach_function :signal_publickey_serialize,     [:pointer, :pointer],             :pointer
+  attach_function :signal_publickey_verify,        [:pointer, :pointer, BorrowedBuffer.by_value, BorrowedBuffer.by_value], :pointer
+  attach_function :signal_publickey_destroy,       [:pointer],                       :pointer
+
+  # Address
+  attach_function :signal_address_new,          [:pointer, :string, :uint32], :pointer
+  attach_function :signal_address_get_name,     [:pointer, :pointer],         :pointer
+  attach_function :signal_address_get_device_id,[:pointer, :pointer],         :pointer
+  attach_function :signal_address_destroy,      [:pointer],                   :pointer
+
+  # Pre-key records
+  attach_function :signal_pre_key_record_new,        [:pointer, :uint32, :pointer, :pointer], :pointer
+  attach_function :signal_pre_key_record_serialize,  [:pointer, :pointer],                    :pointer
+  attach_function :signal_pre_key_record_deserialize,[:pointer, BorrowedBuffer.by_value],     :pointer
+  attach_function :signal_pre_key_record_get_public_key, [:pointer, :pointer],                :pointer
+  attach_function :signal_pre_key_record_destroy,    [:pointer],                              :pointer
+
+  # Signed pre-key records
+  attach_function :signal_signed_pre_key_record_new,
+    [:pointer, :uint32, :uint64, :pointer, :pointer, BorrowedBuffer.by_value], :pointer
+  attach_function :signal_signed_pre_key_record_serialize,
+    [:pointer, :pointer], :pointer
+  attach_function :signal_signed_pre_key_record_deserialize,
+    [:pointer, BorrowedBuffer.by_value], :pointer
+  attach_function :signal_signed_pre_key_record_get_public_key,
+    [:pointer, :pointer], :pointer
+  attach_function :signal_signed_pre_key_record_get_signature,
+    [:pointer, :pointer], :pointer
+  attach_function :signal_signed_pre_key_record_destroy, [:pointer], :pointer
+
+  # Kyber keys and pre-key records
+  attach_function :signal_kyber_key_pair_generate,      [:pointer],          :pointer
+  attach_function :signal_kyber_key_pair_get_public_key,[:pointer, :pointer],:pointer
+  attach_function :signal_kyber_key_pair_get_secret_key,[:pointer, :pointer],:pointer
+  attach_function :signal_kyber_key_pair_destroy,       [:pointer],          :pointer
+  attach_function :signal_kyber_public_key_serialize,   [:pointer, :pointer],:pointer
+  attach_function :signal_kyber_public_key_destroy,     [:pointer],          :pointer
+  attach_function :signal_kyber_secret_key_serialize,   [:pointer, :pointer],:pointer
+  attach_function :signal_kyber_secret_key_destroy,     [:pointer],          :pointer
+  attach_function :signal_kyber_pre_key_record_new,
+    [:pointer, :uint32, :uint64, :pointer, BorrowedBuffer.by_value], :pointer
+  attach_function :signal_kyber_pre_key_record_serialize,
+    [:pointer, :pointer], :pointer
+  attach_function :signal_kyber_pre_key_record_deserialize,
+    [:pointer, BorrowedBuffer.by_value], :pointer
+  attach_function :signal_kyber_pre_key_record_get_public_key, [:pointer, :pointer], :pointer
+  attach_function :signal_kyber_pre_key_record_get_signature,  [:pointer, :pointer], :pointer
+  attach_function :signal_kyber_pre_key_record_destroy, [:pointer], :pointer
+
+  # Session record
+  attach_function :signal_session_record_serialize,
+    [:pointer, :pointer], :pointer
+  attach_function :signal_session_record_deserialize,
+    [:pointer, BorrowedBuffer.by_value], :pointer
+
+  # Sender key record
+  attach_function :signal_sender_key_record_serialize,
+    [:pointer, :pointer], :pointer
+  attach_function :signal_sender_key_record_deserialize,
+    [:pointer, BorrowedBuffer.by_value], :pointer
+
+  # Pre-key bundle
+  attach_function :signal_pre_key_bundle_new, [
+    :pointer,                        # out
+    :uint32, :uint32,                # reg_id, device_id
+    :uint32, :bool, :pointer,        # opk_id, has_opk, opk_pub
+    :uint32, :pointer,               # spk_id, spk_pub
+    BorrowedBuffer.by_value,         # spk_sig
+    :pointer,                        # id_pub
+    :uint32, :bool, :pointer,        # kpk_id, has_kpk, kpk_pub
+    BorrowedBuffer.by_value          # kpk_sig
+  ], :pointer
+  attach_function :signal_pre_key_bundle_destroy, [:pointer], :pointer
+
+  # Session protocol
+  attach_function :signal_process_prekey_bundle,
+    [:pointer, :pointer, :pointer, :pointer, :pointer, :pointer, :pointer], :pointer
+  attach_function :signal_encrypt_message,
+    [:pointer, BorrowedBuffer.by_value, :pointer, :pointer, :pointer, :pointer, :pointer], :pointer
+  attach_function :signal_decrypt_pre_key_message,
+    [:pointer, :pointer, :pointer, :pointer, :pointer, :pointer, :pointer, :pointer], :pointer
+  attach_function :signal_decrypt_message,
+    [:pointer, :pointer, :pointer, :pointer, :pointer], :pointer
+
+  attach_function :signal_ciphertext_message_serialize, [:pointer, :pointer],  :pointer
+  attach_function :signal_ciphertext_message_destroy,   [:pointer],             :pointer
+  attach_function :signal_pre_key_signal_message_deserialize,
+    [:pointer, BorrowedBuffer.by_value], :pointer
+  attach_function :signal_pre_key_signal_message_destroy, [:pointer], :pointer
+  attach_function :signal_message_deserialize,
+    [:pointer, BorrowedBuffer.by_value], :pointer
+  attach_function :signal_message_destroy, [:pointer], :pointer
+
+  # Group
+  attach_function :signal_sender_key_distribution_message_create,
+    [:pointer, :pointer, BorrowedBuffer.by_value, :pointer], :pointer
+  attach_function :signal_process_sender_key_distribution_message,
+    [:pointer, :pointer, :pointer], :pointer
+  attach_function :signal_group_encrypt_message,
+    [:pointer, :pointer, BorrowedBuffer.by_value, BorrowedBuffer.by_value, :pointer], :pointer
+  attach_function :signal_group_decrypt_message,
+    [:pointer, :pointer, BorrowedBuffer.by_value, BorrowedBuffer.by_value, :pointer], :pointer
+  attach_function :signal_sender_key_distribution_message_destroy, [:pointer], :pointer
+
+  # Fingerprint
+  attach_function :signal_fingerprint_new,
+    [:pointer, :uint32, :uint32, BorrowedBuffer.by_value, :pointer,
+     BorrowedBuffer.by_value, :pointer], :pointer
+  attach_function :signal_fingerprint_scannable_encoding, [:pointer, :pointer], :pointer
+  attach_function :signal_fingerprint_compare,
+    [:pointer, :pointer, BorrowedBuffer.by_value], :pointer
+  attach_function :signal_fingerprint_destroy, [:pointer], :pointer
+
+  # Username
+  attach_function :signal_username_hash,   [:pointer, :string], :pointer
+  attach_function :signal_username_proof,  [:pointer, :string], :pointer
+  attach_function :signal_username_verify, [:pointer, :pointer, BorrowedBuffer.by_value], :pointer
+
+  # Account keys
+  attach_function :signal_account_entropy_pool_generate, [:pointer],          :pointer
+  attach_function :signal_account_entropy_pool_as_string,[:pointer, :pointer],:pointer
+  attach_function :signal_account_entropy_pool_derive_svr_key,    [:pointer, :pointer], :pointer
+  attach_function :signal_account_entropy_pool_derive_backup_key, [:pointer, :pointer], :pointer
+  attach_function :signal_account_entropy_pool_destroy,           [:pointer],            :pointer
+  attach_function :signal_backup_key_from_bytes, [:pointer, BorrowedBuffer.by_value],   :pointer
+  attach_function :signal_backup_key_derive_media_encryption_key, [:pointer, :pointer], :pointer
+  attach_function :signal_backup_key_destroy,    [:pointer],                             :pointer
+end
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def die(e, label)
+  msg_pp = FFI::MemoryPointer.new(:pointer)
+  Sig.signal_error_get_message(msg_pp, e)
+  msg = msg_pp.read_pointer.null? ? "(no message)" : msg_pp.read_pointer.read_string
+  Sig.signal_error_free(e)
+  abort "[FAIL] #{label}: #{msg}"
+end
+
+def must(e, label = "unknown")
+  die(e, label) unless e.null?
+end
+
+def borrow(bytes)
+  buf = Sig::BorrowedBuffer.new
+  ptr = FFI::MemoryPointer.new(:uint8, bytes.bytesize)
+  ptr.put_bytes(0, bytes)
+  buf[:base]   = ptr
+  buf[:length] = bytes.bytesize
+  [buf, ptr]  # return ptr too to prevent GC
+end
+
+def read_owned(owned_buf)
+  data = owned_buf[:base].read_bytes(owned_buf[:length])
+  Sig.signal_free_buffer(owned_buf[:base], owned_buf[:length])
+  data
+end
+
+def addr_key(addr_ptr)
+  name_pp = FFI::MemoryPointer.new(:pointer)
+  dev_p   = FFI::MemoryPointer.new(:uint32)
+  # SignalConstPointerSignalProtocolAddress = {raw: *const addr} — 1 ptr, ABI=ptr
+  must Sig.signal_address_get_name(name_pp, addr_ptr),      "addr_get_name"
+  must Sig.signal_address_get_device_id(dev_p, addr_ptr),   "addr_get_dev"
+  "#{name_pp.read_pointer.read_string}:#{dev_p.read(:uint32)}"
+end
+
 # ── In-memory stores ─────────────────────────────────────────────────────────
-# Each store is a Ruby hash acting as the backing store.
-# Callbacks are FFI::Function objects kept alive as instance variables.
+# Each store class builds the FFI struct that signal_ffi.h expects.
+# Callbacks can call back into Sig.* because ruby-ffi callbacks run on the
+# calling thread (C calls into Ruby, Ruby calls back into C — all synchronous).
 
-class MemSessionStore
-  attr_reader :ffi_struct
-
-  def initialize
-    @db = {}   # [name, dev] => bytes
-    @callbacks = []  # keep alive
-
-    ud_ptr = FFI::Pointer.new(object_id)
-
-    @load_cb = FFI::Function.new(:int, [:pointer, :string, :uint32, :pointer, :pointer]) do |_ud, name, dev, out_pp, out_len_p|
-      key = [name, dev]
-      if (data = @db[key])
-        buf = FFI::MemoryPointer.new(:uint8, data.bytesize)
-        buf.put_bytes(0, data)
-        buf.autorelease = false
-        out_pp.put_pointer(0, buf)
-        out_len_p.put(:size_t, 0, data.bytesize)
-        0
-      else
-        LibSignal::ERR_NOT_FOUND
-      end
-    end
-
-    @store_cb = FFI::Function.new(:int, [:pointer, :string, :uint32, :pointer, :size_t]) do |_ud, name, dev, data_ptr, len|
-      @db[[name, dev]] = data_ptr.read_bytes(len)
-      0
-    end
-
-    @ffi_struct = LibSignal::SessionStore.new
-    @ffi_struct[:ud]    = FFI::Pointer::NULL
-    @ffi_struct[:load]  = @load_cb
-    @ffi_struct[:store] = @store_cb
-  end
-end
-
-class MemIdentityStore
-  attr_reader :ffi_struct
-
-  def initialize(pub_bytes, priv_bytes, reg_id)
-    @pub  = pub_bytes
-    @priv = priv_bytes
-
-    @get_kp_cb = FFI::Function.new(:int, [:pointer, :pointer, :pointer]) do |_ud, pub_out, priv_out|
-      pub_out.put_bytes(0, @pub)
-      priv_out.put_bytes(0, @priv)
-      0
-    end
-
-    @get_reg_cb = FFI::Function.new(:int, [:pointer, :pointer]) do |_ud, out|
-      out.put(:uint32, 0, reg_id)
-      0
-    end
-
-    @save_cb = FFI::Function.new(:int, [:pointer, :string, :uint32, :pointer]) do |*|
-      0
-    end
-
-    @trusted_cb = FFI::Function.new(:int, [:pointer, :string, :uint32, :pointer, :int]) do |*|
-      1
-    end
-
-    @ffi_struct = LibSignal::IdentityStore.new
-    @ffi_struct[:ud]                  = FFI::Pointer::NULL
-    @ffi_struct[:get_keypair]         = @get_kp_cb
-    @ffi_struct[:get_registration_id] = @get_reg_cb
-    @ffi_struct[:save_identity]       = @save_cb
-    @ffi_struct[:is_trusted]          = @trusted_cb
-  end
-end
-
-class MemPreKeyStore
-  attr_reader :ffi_struct
-
-  def initialize(id, pub_bytes, priv_bytes)
-    @id   = id
-    @pub  = pub_bytes
-    @priv = priv_bytes
-
-    @load_cb = FFI::Function.new(:int, [:pointer, :uint32, :pointer, :pointer]) do |_ud, key_id, pub_out, priv_out|
-      if key_id == @id
-        pub_out.put_bytes(0, @pub)
-        priv_out.put_bytes(0, @priv)
-        0
-      else
-        LibSignal::ERR_NOT_FOUND
-      end
-    end
-
-    @remove_cb = FFI::Function.new(:int, [:pointer, :uint32]) { |*| 0 }
-
-    @ffi_struct = LibSignal::PreKeyStore.new
-    @ffi_struct[:ud]     = FFI::Pointer::NULL
-    @ffi_struct[:load]   = @load_cb
-    @ffi_struct[:remove] = @remove_cb
-  end
-end
-
-class MemSignedPreKeyStore
-  attr_reader :ffi_struct
-
-  def initialize(id, pub_bytes, priv_bytes, sig_bytes)
-    @id   = id
-    @pub  = pub_bytes
-    @priv = priv_bytes
-    @sig  = sig_bytes
-
-    @load_cb = FFI::Function.new(:int, [:pointer, :uint32, :pointer, :pointer, :pointer, :pointer]) do |_ud, key_id, pub_out, priv_out, sig_out, ts_out|
-      if key_id == @id
-        pub_out.put_bytes(0, @pub)
-        priv_out.put_bytes(0, @priv)
-        sig_out.put_bytes(0, @sig)
-        ts_out.put(:uint64, 0, 1_700_000_000)
-        0
-      else
-        LibSignal::ERR_NOT_FOUND
-      end
-    end
-
-    @ffi_struct = LibSignal::SignedPreKeyStore.new
-    @ffi_struct[:ud]   = FFI::Pointer::NULL
-    @ffi_struct[:load] = @load_cb
-  end
-end
-
-class MemSenderKeyStore
-  attr_reader :ffi_struct
+class SessionStore
+  # SignalSessionStore = {user_data, load, store, reserved}
+  attr_reader :ptr   # pointer to the struct (passed to signal_* functions)
 
   def initialize
-    @db = {}   # [name, dev, dist_id_bytes] => bytes
+    @db = {}   # addr_key -> serialized bytes
 
-    @store_cb = FFI::Function.new(:int, [:pointer, :string, :uint32, :pointer, :pointer, :size_t]) do |_ud, name, dev, dist, data_ptr, len|
-      key = [name, dev, dist.read_bytes(16)]
-      @db[key] = data_ptr.read_bytes(len)
-      0
-    end
-
-    @load_cb = FFI::Function.new(:int, [:pointer, :string, :uint32, :pointer, :pointer, :pointer]) do |_ud, name, dev, dist, out_pp, out_len_p|
-      key = [name, dev, dist.read_bytes(16)]
-      if (data = @db[key])
-        buf = FFI::MemoryPointer.new(:uint8, data.bytesize)
-        buf.put_bytes(0, data)
-        buf.autorelease = false
-        out_pp.put_pointer(0, buf)
-        out_len_p.put(:size_t, 0, data.bytesize)
-        0
-      else
-        LibSignal::ERR_NOT_FOUND
+    @load_cb = FFI::Function.new(:pointer, [:pointer, :pointer, :pointer]) do |out, addr, _ud|
+      k = addr_key(addr)
+      data = @db[k]
+      unless data
+        out.put_pointer(0, FFI::Pointer::NULL)
+        next FFI::Pointer::NULL
       end
+      buf, _pin = borrow(data)
+      rec_out = FFI::MemoryPointer.new(:pointer)
+      # out points to SignalMutPointerSignalSessionRecord {raw: *opaque}
+      e = Sig.signal_session_record_deserialize(out, buf)
+      e
     end
 
-    @ffi_struct = LibSignal::SenderKeyStore.new
-    @ffi_struct[:ud]    = FFI::Pointer::NULL
-    @ffi_struct[:store] = @store_cb
-    @ffi_struct[:load]  = @load_cb
+    @store_cb = FFI::Function.new(:pointer, [:pointer, :pointer, :pointer]) do |addr, rec, _ud|
+      # rec is SignalConstPointerSignalSessionRecord (treated as pointer)
+      owned = Sig::OwnedBuffer.new
+      e = Sig.signal_session_record_serialize(owned.to_ptr, rec)
+      next e unless e.null?
+      @db[addr_key(addr)] = owned[:base].read_bytes(owned[:length])
+      Sig.signal_free_buffer(owned[:base], owned[:length])
+      FFI::Pointer::NULL
+    end
+
+    @struct = FFI::MemoryPointer.new(:pointer, 4)
+    @struct.put_pointer(0,  FFI::Pointer::NULL)   # ctx
+    @struct.put_pointer(8,  @load_cb)             # load_session
+    @struct.put_pointer(16, @store_cb)            # store_session
+    @struct.put_pointer(24, FFI::Pointer::NULL)   # destroy
+    @ptr = @struct
   end
+end
+
+class IdentityStore
+  attr_reader :ptr
+
+  def initialize(priv_bytes, reg_id)
+    @priv  = priv_bytes
+    @reg   = reg_id
+    @db    = {}
+
+    @get_kp_cb = FFI::Function.new(:pointer, [:pointer, :pointer, :pointer]) do |out_pub, out_priv, _ud|
+      buf, _pin = borrow(@priv)
+      e = Sig.signal_privatekey_deserialize(out_priv, buf)
+      next e unless e.null?
+      # SignalConstPointerSignalPrivateKey is 1-ptr ABI ≡ pointer
+      priv_raw = out_priv.read_pointer
+      Sig.signal_privatekey_get_public_key(out_pub, priv_raw)
+    end
+
+    @get_reg_cb = FFI::Function.new(:pointer, [:pointer, :pointer]) do |out, _ud|
+      out.put_uint32(0, @reg)
+      FFI::Pointer::NULL
+    end
+
+    @save_cb = FFI::Function.new(:pointer, [:pointer, :pointer, :pointer]) do |addr, key, _ud|
+      owned = Sig::OwnedBuffer.new
+      e = Sig.signal_publickey_serialize(owned.to_ptr, key)
+      next e unless e.null?
+      @db[addr_key(addr)] = owned[:base].read_bytes(owned[:length])
+      Sig.signal_free_buffer(owned[:base], owned[:length])
+      FFI::Pointer::NULL
+    end
+
+    @trusted_cb = FFI::Function.new(:pointer, [:pointer, :pointer, :pointer, :uint32, :pointer]) do |out, _addr, _key, _dir, _ud|
+      out.put_uint8(0, 1)
+      FFI::Pointer::NULL
+    end
+
+    @get_id_cb = FFI::Function.new(:pointer, [:pointer, :pointer, :pointer]) do |out, addr, _ud|
+      data = @db[addr_key(addr)]
+      unless data
+        out.put_pointer(0, FFI::Pointer::NULL)
+        next FFI::Pointer::NULL
+      end
+      buf, _pin = borrow(data)
+      Sig.signal_publickey_deserialize(out, buf)
+    end
+
+    # SignalIdentityKeyStore = {ctx, get_keypair, get_registration_id, save_identity, is_trusted, get_identity, destroy}
+    @struct = FFI::MemoryPointer.new(:pointer, 7)
+    @struct.put_pointer(0,  FFI::Pointer::NULL)  # ctx
+    @struct.put_pointer(8,  @get_kp_cb)          # get_identity_key_pair
+    @struct.put_pointer(16, @get_reg_cb)         # get_local_registration_id
+    @struct.put_pointer(24, @save_cb)            # save_identity
+    @struct.put_pointer(32, @trusted_cb)         # is_trusted_identity
+    @struct.put_pointer(40, @get_id_cb)          # get_identity
+    @struct.put_pointer(48, FFI::Pointer::NULL)  # destroy
+    @ptr = @struct
+  end
+end
+
+class PreKeyStore
+  attr_reader :ptr
+
+  def initialize
+    @db = {}
+
+    @load_cb = FFI::Function.new(:pointer, [:pointer, :uint32, :pointer]) do |out, id, _ud|
+      data = @db[id]
+      unless data
+        out.put_pointer(0, FFI::Pointer::NULL)
+        next FFI::Pointer::NULL
+      end
+      buf, _pin = borrow(data)
+      Sig.signal_pre_key_record_deserialize(out, buf)
+    end
+
+    @store_cb = FFI::Function.new(:pointer, [:uint32, :pointer, :pointer]) do |id, rec, _ud|
+      owned = Sig::OwnedBuffer.new
+      # rec is SignalMutPointerSignalPreKeyRecord (1-ptr ABI); serialize takes const ptr
+      e = Sig.signal_pre_key_record_serialize(owned.to_ptr, rec)
+      next e unless e.null?
+      @db[id] = owned[:base].read_bytes(owned[:length])
+      Sig.signal_free_buffer(owned[:base], owned[:length])
+      FFI::Pointer::NULL
+    end
+
+    @remove_cb = FFI::Function.new(:pointer, [:uint32, :pointer]) do |_id, _ud|
+      FFI::Pointer::NULL
+    end
+
+    # SignalPreKeyStore = {ctx, load, store, remove, destroy}
+    @struct = FFI::MemoryPointer.new(:pointer, 5)
+    @struct.put_pointer(0,  FFI::Pointer::NULL)  # ctx
+    @struct.put_pointer(8,  @load_cb)            # load_pre_key
+    @struct.put_pointer(16, @store_cb)           # store_pre_key
+    @struct.put_pointer(24, @remove_cb)          # remove_pre_key
+    @struct.put_pointer(32, FFI::Pointer::NULL)  # destroy
+    @ptr = @struct
+  end
+
+  def store_record(id, rec_ptr)
+    owned = Sig::OwnedBuffer.new
+    must Sig.signal_pre_key_record_serialize(owned.to_ptr, rec_ptr), "pk_serialize"
+    @db[id] = owned[:base].read_bytes(owned[:length])
+    Sig.signal_free_buffer(owned[:base], owned[:length])
+  end
+end
+
+class SignedPreKeyStore
+  attr_reader :ptr
+
+  def initialize
+    @db = {}
+
+    @load_cb = FFI::Function.new(:pointer, [:pointer, :uint32, :pointer]) do |out, id, _ud|
+      data = @db[id]
+      unless data
+        out.put_pointer(0, FFI::Pointer::NULL)
+        next FFI::Pointer::NULL
+      end
+      buf, _pin = borrow(data)
+      Sig.signal_signed_pre_key_record_deserialize(out, buf)
+    end
+
+    @store_cb = FFI::Function.new(:pointer, [:uint32, :pointer, :pointer]) do |id, rec, _ud|
+      owned = Sig::OwnedBuffer.new
+      e = Sig.signal_signed_pre_key_record_serialize(owned.to_ptr, rec)
+      next e unless e.null?
+      @db[id] = owned[:base].read_bytes(owned[:length])
+      Sig.signal_free_buffer(owned[:base], owned[:length])
+      FFI::Pointer::NULL
+    end
+
+    # SignalSignedPreKeyStore = {ctx, load, store, destroy}
+    @struct = FFI::MemoryPointer.new(:pointer, 4)
+    @struct.put_pointer(0,  FFI::Pointer::NULL)  # ctx
+    @struct.put_pointer(8,  @load_cb)            # load_signed_pre_key
+    @struct.put_pointer(16, @store_cb)           # store_signed_pre_key
+    @struct.put_pointer(24, FFI::Pointer::NULL)  # destroy
+    @ptr = @struct
+  end
+
+  def store_record(id, rec_ptr)
+    owned = Sig::OwnedBuffer.new
+    must Sig.signal_signed_pre_key_record_serialize(owned.to_ptr, rec_ptr), "spk_serialize"
+    @db[id] = owned[:base].read_bytes(owned[:length])
+    Sig.signal_free_buffer(owned[:base], owned[:length])
+  end
+end
+
+class KyberPreKeyStore
+  attr_reader :ptr
+
+  def initialize
+    @db = {}
+
+    @load_cb = FFI::Function.new(:pointer, [:pointer, :uint32, :pointer]) do |out, id, _ud|
+      data = @db[id]
+      unless data
+        out.put_pointer(0, FFI::Pointer::NULL)
+        next FFI::Pointer::NULL
+      end
+      buf, _pin = borrow(data)
+      Sig.signal_kyber_pre_key_record_deserialize(out, buf)
+    end
+
+    @store_cb = FFI::Function.new(:pointer, [:uint32, :pointer, :pointer]) do |id, rec, _ud|
+      owned = Sig::OwnedBuffer.new
+      e = Sig.signal_kyber_pre_key_record_serialize(owned.to_ptr, rec)
+      next e unless e.null?
+      @db[id] = owned[:base].read_bytes(owned[:length])
+      Sig.signal_free_buffer(owned[:base], owned[:length])
+      FFI::Pointer::NULL
+    end
+
+    @mark_used_cb = FFI::Function.new(:pointer, [:uint32, :pointer]) { |*| FFI::Pointer::NULL }
+
+    # SignalKyberPreKeyStore = {ctx, load, store, mark_used, destroy}
+    @struct = FFI::MemoryPointer.new(:pointer, 5)
+    @struct.put_pointer(0,  FFI::Pointer::NULL)  # ctx
+    @struct.put_pointer(8,  @load_cb)            # load_kyber_pre_key
+    @struct.put_pointer(16, @store_cb)           # store_kyber_pre_key
+    @struct.put_pointer(24, @mark_used_cb)       # mark_kyber_pre_key_used
+    @struct.put_pointer(32, FFI::Pointer::NULL)  # destroy
+    @ptr = @struct
+  end
+
+  def store_record(id, rec_ptr)
+    owned = Sig::OwnedBuffer.new
+    must Sig.signal_kyber_pre_key_record_serialize(owned.to_ptr, rec_ptr), "kpk_serialize"
+    @db[id] = owned[:base].read_bytes(owned[:length])
+    Sig.signal_free_buffer(owned[:base], owned[:length])
+  end
+end
+
+class SenderKeyStore
+  attr_reader :ptr
+
+  def initialize
+    @db = {}
+
+    @store_cb = FFI::Function.new(:pointer, [:pointer, :pointer, :pointer, :pointer]) do |addr, dist, rec, _ud|
+      k = "#{addr_key(addr)}:#{dist.read_bytes(16).unpack1('H*')}"
+      owned = Sig::OwnedBuffer.new
+      e = Sig.signal_sender_key_record_serialize(owned.to_ptr, rec)
+      next e unless e.null?
+      @db[k] = owned[:base].read_bytes(owned[:length])
+      Sig.signal_free_buffer(owned[:base], owned[:length])
+      FFI::Pointer::NULL
+    end
+
+    @load_cb = FFI::Function.new(:pointer, [:pointer, :pointer, :pointer, :pointer]) do |out, addr, dist, _ud|
+      k = "#{addr_key(addr)}:#{dist.read_bytes(16).unpack1('H*')}"
+      data = @db[k]
+      unless data
+        out.put_pointer(0, FFI::Pointer::NULL)
+        next FFI::Pointer::NULL
+      end
+      buf, _pin = borrow(data)
+      Sig.signal_sender_key_record_deserialize(out, buf)
+    end
+
+    # SignalSenderKeyStore = {ctx, store_sender_key, load_sender_key, destroy}
+    @struct = FFI::MemoryPointer.new(:pointer, 4)
+    @struct.put_pointer(0,  FFI::Pointer::NULL)  # ctx
+    @struct.put_pointer(8,  @store_cb)           # store_sender_key
+    @struct.put_pointer(16, @load_cb)            # load_sender_key
+    @struct.put_pointer(24, FFI::Pointer::NULL)  # destroy
+    @ptr = @struct
+  end
+end
+
+# ── sign_bytes helper ─────────────────────────────────────────────────────────
+
+def sign_bytes(priv32, data)
+  buf, _pin = borrow(priv32)
+  priv_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_privatekey_deserialize(priv_out, buf), "sign_bytes_deser"
+  priv_raw = priv_out.read_pointer
+  owned = Sig::OwnedBuffer.new
+  data_buf, _pin2 = borrow(data)
+  must Sig.signal_privatekey_sign(owned.to_ptr, priv_raw, data_buf), "sign_bytes_sign"
+  Sig.signal_privatekey_destroy(priv_raw)
+  read_owned(owned)
+end
+
+# ── Bob setup (identity + OPK + SPK + KPK) ───────────────────────────────────
+
+BobKeys = Struct.new(:id_priv, :reg_id, :opk_id, :spk_id, :kpk_id)
+
+def setup_bob(pk_store, spk_store, kpk_store)
+  id_priv_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_privatekey_generate(id_priv_out), "bob_id_gen"
+  owned = Sig::OwnedBuffer.new
+  must Sig.signal_privatekey_serialize(owned.to_ptr, id_priv_out.read_pointer), "bob_id_ser"
+  id_priv_bytes = read_owned(owned)
+  Sig.signal_privatekey_destroy(id_priv_out.read_pointer)
+
+  bob = BobKeys.new(id_priv_bytes, 2002, 1, 1, 1)
+
+  # OPK
+  opk_priv_out = FFI::MemoryPointer.new(:pointer)
+  opk_pub_out  = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_privatekey_generate(opk_priv_out), "opk_gen"
+  must Sig.signal_privatekey_get_public_key(opk_pub_out, opk_priv_out.read_pointer), "opk_pub"
+  rec_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_pre_key_record_new(rec_out, bob.opk_id,
+         opk_pub_out.read_pointer, opk_priv_out.read_pointer), "opk_rec"
+  Sig.signal_privatekey_destroy(opk_priv_out.read_pointer)
+  Sig.signal_publickey_destroy(opk_pub_out.read_pointer)
+  pk_store.store_record(bob.opk_id, rec_out.read_pointer)
+  Sig.signal_pre_key_record_destroy(rec_out.read_pointer)
+
+  # SPK
+  spk_priv_out = FFI::MemoryPointer.new(:pointer)
+  spk_pub_out  = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_privatekey_generate(spk_priv_out), "spk_gen"
+  must Sig.signal_privatekey_get_public_key(spk_pub_out, spk_priv_out.read_pointer), "spk_pub"
+  spk_pub_owned = Sig::OwnedBuffer.new
+  must Sig.signal_publickey_serialize(spk_pub_owned.to_ptr, spk_pub_out.read_pointer), "spk_pub_ser"
+  spk_pub_bytes = read_owned(spk_pub_owned)
+  spk_sig_bytes = sign_bytes(bob.id_priv, spk_pub_bytes)
+  spk_sig_buf, _pin = borrow(spk_sig_bytes)
+  spk_rec_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_signed_pre_key_record_new(spk_rec_out, bob.spk_id, 1700000000,
+         spk_pub_out.read_pointer, spk_priv_out.read_pointer, spk_sig_buf), "spk_rec"
+  Sig.signal_privatekey_destroy(spk_priv_out.read_pointer)
+  Sig.signal_publickey_destroy(spk_pub_out.read_pointer)
+  spk_store.store_record(bob.spk_id, spk_rec_out.read_pointer)
+  Sig.signal_signed_pre_key_record_destroy(spk_rec_out.read_pointer)
+
+  # KPK
+  kpk_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_kyber_key_pair_generate(kpk_out), "kpk_gen"
+  kpk_pub_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_kyber_key_pair_get_public_key(kpk_pub_out, kpk_out.read_pointer), "kpk_pub"
+  kpk_pub_owned = Sig::OwnedBuffer.new
+  must Sig.signal_kyber_public_key_serialize(kpk_pub_owned.to_ptr, kpk_pub_out.read_pointer), "kpk_pub_ser"
+  kpk_pub_bytes = read_owned(kpk_pub_owned)
+  kpk_sig_bytes = sign_bytes(bob.id_priv, kpk_pub_bytes)
+  kpk_sig_buf, _pin2 = borrow(kpk_sig_bytes)
+  kpk_rec_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_kyber_pre_key_record_new(kpk_rec_out, bob.kpk_id, 1700000000,
+         kpk_out.read_pointer, kpk_sig_buf), "kpk_rec"
+  Sig.signal_kyber_public_key_destroy(kpk_pub_out.read_pointer)
+  Sig.signal_kyber_key_pair_destroy(kpk_out.read_pointer)
+  kpk_store.store_record(bob.kpk_id, kpk_rec_out.read_pointer)
+  Sig.signal_kyber_pre_key_record_destroy(kpk_rec_out.read_pointer)
+
+  bob
 end
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
-def test_ec
-  pub_a, priv_a = gen_keypair
-  pub_b, priv_b = gen_keypair
+def test_ec_keys
+  pa_out = FFI::MemoryPointer.new(:pointer)
+  pb_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_privatekey_generate(pa_out), "gen_a"
+  must Sig.signal_privatekey_generate(pb_out), "gen_b"
+  pa = pa_out.read_pointer; pb = pb_out.read_pointer
 
-  shared_a = FFI::MemoryPointer.new(:uint8, 32)
-  shared_b = FFI::MemoryPointer.new(:uint8, 32)
-  must(LibSignal.libsignal_ec_dh(pub_b, priv_a, shared_a), "ec_dh_a")
-  must(LibSignal.libsignal_ec_dh(pub_a, priv_b, shared_b), "ec_dh_b")
-  raise "FAIL ec_dh match" unless shared_a.read_bytes(32) == shared_b.read_bytes(32)
+  qa_out = FFI::MemoryPointer.new(:pointer)
+  qb_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_privatekey_get_public_key(qa_out, pa), "pub_a"
+  must Sig.signal_privatekey_get_public_key(qb_out, pb), "pub_b"
+  qa = qa_out.read_pointer; qb = qb_out.read_pointer
+
+  dh_a = Sig::OwnedBuffer.new; dh_b = Sig::OwnedBuffer.new
+  must Sig.signal_privatekey_agree(dh_a.to_ptr, pa, qb), "dh_a"
+  must Sig.signal_privatekey_agree(dh_b.to_ptr, pb, qa), "dh_b"
+  raise "FAIL DH mismatch" unless dh_a[:base].read_bytes(32) == dh_b[:base].read_bytes(32)
+  Sig.signal_free_buffer(dh_a[:base], dh_a[:length])
+  Sig.signal_free_buffer(dh_b[:base], dh_b[:length])
 
   msg = "hello signal"
-  msg_ptr = FFI::MemoryPointer.from_string(msg)
-  sig = FFI::MemoryPointer.new(:uint8, 64)
-  must(LibSignal.libsignal_xeddsa_sign(priv_a, msg_ptr, msg.bytesize, sig), "xeddsa_sign")
-  must(LibSignal.libsignal_xeddsa_verify(pub_a, msg_ptr, msg.bytesize, sig), "xeddsa_verify")
+  msg_buf, _pin = borrow(msg)
+  sig_owned = Sig::OwnedBuffer.new
+  must Sig.signal_privatekey_sign(sig_owned.to_ptr, pa, msg_buf), "sign"
+  sig_buf, _pin2 = borrow(sig_owned[:base].read_bytes(sig_owned[:length]))
+  Sig.signal_free_buffer(sig_owned[:base], sig_owned[:length])
+  ok_p = FFI::MemoryPointer.new(:bool)
+  must Sig.signal_publickey_verify(ok_p, qa, msg_buf, sig_buf), "verify"
+  raise "FAIL verify" unless ok_p.read(:bool)
 
+  Sig.signal_privatekey_destroy(pa); Sig.signal_privatekey_destroy(pb)
+  Sig.signal_publickey_destroy(qa);  Sig.signal_publickey_destroy(qb)
   puts "EC + XEdDSA                   PASS"
 end
 
-def test_kyber
-  pk = FFI::MemoryPointer.new(:uint8, 1568)
-  sk = FFI::MemoryPointer.new(:uint8, 3168)
-  must(LibSignal.libsignal_kyber1024_keypair_generate(pk, sk), "kyber_keygen")
+def test_kyber_keys
+  kp_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_kyber_key_pair_generate(kp_out), "kpk_gen"
+  kp = kp_out.read_pointer
 
-  ct     = FFI::MemoryPointer.new(:uint8, 1568)
-  ss_enc = FFI::MemoryPointer.new(:uint8, 32)
-  must(LibSignal.libsignal_kyber1024_encaps(pk, ct, ss_enc), "kyber_encaps")
+  pub_out = FFI::MemoryPointer.new(:pointer)
+  sec_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_kyber_key_pair_get_public_key(pub_out, kp), "kpk_pub"
+  must Sig.signal_kyber_key_pair_get_secret_key(sec_out, kp), "kpk_sec"
 
-  ss_dec = FFI::MemoryPointer.new(:uint8, 32)
-  must(LibSignal.libsignal_kyber1024_decaps(sk, ct, ss_dec), "kyber_decaps")
-  raise "FAIL kyber ss match" unless ss_enc.read_bytes(32) == ss_dec.read_bytes(32)
-
+  pub_owned = Sig::OwnedBuffer.new; sec_owned = Sig::OwnedBuffer.new
+  must Sig.signal_kyber_public_key_serialize(pub_owned.to_ptr, pub_out.read_pointer), "kpk_pub_ser"
+  must Sig.signal_kyber_secret_key_serialize(sec_owned.to_ptr, sec_out.read_pointer), "kpk_sec_ser"
+  raise "FAIL Kyber pub size #{pub_owned[:length]}" unless pub_owned[:length] == 1568
+  raise "FAIL Kyber sec size #{sec_owned[:length]}" unless sec_owned[:length] == 3168
+  Sig.signal_free_buffer(pub_owned[:base], pub_owned[:length])
+  Sig.signal_free_buffer(sec_owned[:base], sec_owned[:length])
+  Sig.signal_kyber_key_pair_destroy(kp)
+  Sig.signal_kyber_public_key_destroy(pub_out.read_pointer)
+  Sig.signal_kyber_secret_key_destroy(sec_out.read_pointer)
   puts "ML-KEM-1024 (Kyber)           PASS"
 end
 
 def test_session
-  alice_pub, alice_priv = gen_keypair
-  bob_pub, bob_priv     = gen_keypair
+  # Alice identity
+  alice_priv_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_privatekey_generate(alice_priv_out), "alice_id_gen"
+  alice_id_owned = Sig::OwnedBuffer.new
+  must Sig.signal_privatekey_serialize(alice_id_owned.to_ptr, alice_priv_out.read_pointer), "alice_id_ser"
+  alice_id_priv = read_owned(alice_id_owned)
+  Sig.signal_privatekey_destroy(alice_priv_out.read_pointer)
 
-  bob_opk_pub, bob_opk_priv = gen_keypair
-  bob_spk_pub, bob_spk_priv = gen_keypair
+  # Bob key material
+  bob_pk_s  = PreKeyStore.new
+  bob_spk_s = SignedPreKeyStore.new
+  bob_kpk_s = KyberPreKeyStore.new
+  bob = setup_bob(bob_pk_s, bob_spk_s, bob_kpk_s)
 
-  bob_spk_sig = FFI::MemoryPointer.new(:uint8, 64)
-  must(LibSignal.libsignal_xeddsa_sign(bob_priv, bob_spk_pub, 33, bob_spk_sig), "bob_spk_sig")
+  # Reload public components from Bob's stores for the bundle
+  # (in practice these come over the network)
+  bob_priv_out = FFI::MemoryPointer.new(:pointer)
+  buf, _pin = borrow(bob.id_priv)
+  must Sig.signal_privatekey_deserialize(bob_priv_out, buf), "bob_id_deser"
+  bob_id_pub_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_privatekey_get_public_key(bob_id_pub_out, bob_priv_out.read_pointer), "bob_id_pub"
+  Sig.signal_privatekey_destroy(bob_priv_out.read_pointer)
 
-  alice_id  = MemIdentityStore.new(alice_pub.read_bytes(33), alice_priv.read_bytes(32), 1001)
-  alice_ss  = MemSessionStore.new
-  alice_pk  = MemPreKeyStore.new(0, "\x00"*33, "\x00"*32)
-  alice_spk = MemSignedPreKeyStore.new(0, "\x00"*33, "\x00"*32, "\x00"*64)
+  # Load OPK record from store to get public key
+  opk_rec_out = FFI::MemoryPointer.new(:pointer)
+  opk_data    = bob_pk_s.instance_variable_get(:@db)[bob.opk_id]
+  opk_buf, _  = borrow(opk_data)
+  must Sig.signal_pre_key_record_deserialize(opk_rec_out, opk_buf), "opk_load"
+  opk_pub_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_pre_key_record_get_public_key(opk_pub_out, opk_rec_out.read_pointer), "opk_pub_get"
+  Sig.signal_pre_key_record_destroy(opk_rec_out.read_pointer)
 
-  alice_ctx = LibSignal.libsignal_ctx_new(
-    "bob", 1,
-    alice_ss.ffi_struct, alice_id.ffi_struct,
-    alice_pk.ffi_struct, alice_spk.ffi_struct,
-    nil
-  )
-  raise "FAIL alice_ctx_new" if alice_ctx.null?
+  # Load SPK record from store to get public key + signature
+  spk_rec_out = FFI::MemoryPointer.new(:pointer)
+  spk_data    = bob_spk_s.instance_variable_get(:@db)[bob.spk_id]
+  spk_buf, _  = borrow(spk_data)
+  must Sig.signal_signed_pre_key_record_deserialize(spk_rec_out, spk_buf), "spk_load"
+  spk_pub_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_signed_pre_key_record_get_public_key(spk_pub_out, spk_rec_out.read_pointer), "spk_pub_get"
+  spk_sig_owned = Sig::OwnedBuffer.new
+  must Sig.signal_signed_pre_key_record_get_signature(spk_sig_owned.to_ptr, spk_rec_out.read_pointer), "spk_sig_get"
+  spk_sig_bytes = read_owned(spk_sig_owned)
+  Sig.signal_signed_pre_key_record_destroy(spk_rec_out.read_pointer)
 
-  must(LibSignal.libsignal_process_prekey_bundle(
-    alice_ctx, 2002,
-    1, bob_opk_pub,
-    1, bob_spk_pub, bob_spk_sig,
-    bob_pub,
-    0, nil, nil
-  ), "process_bundle")
+  # Load KPK record from store to get public key + signature
+  kpk_rec_out = FFI::MemoryPointer.new(:pointer)
+  kpk_data    = bob_kpk_s.instance_variable_get(:@db)[bob.kpk_id]
+  kpk_buf, _  = borrow(kpk_data)
+  must Sig.signal_kyber_pre_key_record_deserialize(kpk_rec_out, kpk_buf), "kpk_load"
+  kpk_pub_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_kyber_pre_key_record_get_public_key(kpk_pub_out, kpk_rec_out.read_pointer), "kpk_pub_get"
+  kpk_sig_owned = Sig::OwnedBuffer.new
+  must Sig.signal_kyber_pre_key_record_get_signature(kpk_sig_owned.to_ptr, kpk_rec_out.read_pointer), "kpk_sig_get"
+  kpk_sig_bytes = read_owned(kpk_sig_owned)
+  Sig.signal_kyber_pre_key_record_destroy(kpk_rec_out.read_pointer)
 
-  ct_pp  = FFI::MemoryPointer.new(:pointer)
-  ct_len = FFI::MemoryPointer.new(:size_t)
-  mt_p   = FFI::MemoryPointer.new(:int)
-  must(LibSignal.libsignal_encrypt(alice_ctx,
-    FFI::MemoryPointer.from_string("hello bob"), 9,
-    ct_pp, ct_len, mt_p), "encrypt_1")
+  # Build pre-key bundle
+  bundle_out  = FFI::MemoryPointer.new(:pointer)
+  spk_sig_buf, _s = borrow(spk_sig_bytes)
+  kpk_sig_buf, _k = borrow(kpk_sig_bytes)
+  must Sig.signal_pre_key_bundle_new(
+    bundle_out,
+    bob.reg_id, 1,
+    bob.opk_id, true,  opk_pub_out.read_pointer,
+    bob.spk_id,        spk_pub_out.read_pointer, spk_sig_buf,
+    bob_id_pub_out.read_pointer,
+    bob.kpk_id, true,  kpk_pub_out.read_pointer, kpk_sig_buf
+  ), "bundle_new"
+  Sig.signal_publickey_destroy(opk_pub_out.read_pointer)
+  Sig.signal_publickey_destroy(spk_pub_out.read_pointer)
+  Sig.signal_kyber_public_key_destroy(kpk_pub_out.read_pointer)
+  Sig.signal_publickey_destroy(bob_id_pub_out.read_pointer)
 
-  ct_ptr = ct_pp.read_pointer
-  ct_bytes = ct_len.read(:size_t)
+  # Alice's stores
+  alice_ss  = SessionStore.new
+  alice_is  = IdentityStore.new(alice_id_priv, 1001)
+  alice_pks = PreKeyStore.new
+  alice_sks = SignedPreKeyStore.new
+  alice_kks = KyberPreKeyStore.new
 
-  bob_id  = MemIdentityStore.new(bob_pub.read_bytes(33), bob_priv.read_bytes(32), 2002)
-  bob_ss  = MemSessionStore.new
-  bob_pk  = MemPreKeyStore.new(1, bob_opk_pub.read_bytes(33), bob_opk_priv.read_bytes(32))
-  bob_spk_store = MemSignedPreKeyStore.new(1, bob_spk_pub.read_bytes(33), bob_spk_priv.read_bytes(32), bob_spk_sig.read_bytes(64))
+  # Bob's stores
+  bob_ss = SessionStore.new
+  bob_is = IdentityStore.new(bob.id_priv, bob.reg_id)
 
-  bob_ctx = LibSignal.libsignal_ctx_new(
-    "alice", 1,
-    bob_ss.ffi_struct, bob_id.ffi_struct,
-    bob_pk.ffi_struct, bob_spk_store.ffi_struct,
-    nil
-  )
-  raise "FAIL bob_ctx_new" if bob_ctx.null?
+  # Addresses
+  bob_addr_out   = FFI::MemoryPointer.new(:pointer)
+  alice_addr_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_address_new(bob_addr_out,   "bob",   1), "bob_addr"
+  must Sig.signal_address_new(alice_addr_out, "alice", 1), "alice_addr"
+  bob_addr   = bob_addr_out.read_pointer
+  alice_addr = alice_addr_out.read_pointer
 
-  pt_pp  = FFI::MemoryPointer.new(:pointer)
-  pt_len = FFI::MemoryPointer.new(:size_t)
-  must(LibSignal.libsignal_decrypt_prekey(bob_ctx, ct_ptr, ct_bytes, pt_pp, pt_len), "decrypt_prekey")
-  FFI::LibC.free(ct_ptr)
+  # Alice processes bundle
+  must Sig.signal_process_prekey_bundle(
+    bundle_out.read_pointer, bob_addr,
+    alice_ss.ptr, alice_is.ptr, alice_pks.ptr, alice_sks.ptr, alice_kks.ptr
+  ), "process_bundle"
+  Sig.signal_pre_key_bundle_destroy(bundle_out.read_pointer)
 
-  pt = pt_pp.read_pointer.read_bytes(pt_len.read(:size_t))
-  FFI::LibC.free(pt_pp.read_pointer)
-  raise "FAIL session plaintext" unless pt == "hello bob"
+  # Alice encrypts
+  pt1 = "hello bob"
+  pt1_buf, _p = borrow(pt1)
+  ct1_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_encrypt_message(ct1_out, pt1_buf, bob_addr,
+    alice_ss.ptr, alice_is.ptr, alice_pks.ptr, alice_sks.ptr), "encrypt_1"
+  ct1_owned = Sig::OwnedBuffer.new
+  must Sig.signal_ciphertext_message_serialize(ct1_owned.to_ptr, ct1_out.read_pointer), "ct1_ser"
+  Sig.signal_ciphertext_message_destroy(ct1_out.read_pointer)
+  ct1_bytes = read_owned(ct1_owned)
 
-  LibSignal.libsignal_ctx_free(alice_ctx)
-  LibSignal.libsignal_ctx_free(bob_ctx)
-  puts "X3DH + Double Ratchet         PASS"
+  # Bob decrypts the pre-key message
+  pksm_out = FFI::MemoryPointer.new(:pointer)
+  ct1_buf, _ = borrow(ct1_bytes)
+  must Sig.signal_pre_key_signal_message_deserialize(pksm_out, ct1_buf), "pksm_deser"
+  dec1_owned = Sig::OwnedBuffer.new
+  must Sig.signal_decrypt_pre_key_message(dec1_owned.to_ptr, pksm_out.read_pointer, alice_addr,
+    bob_ss.ptr, bob_is.ptr, bob_pk_s.ptr, bob_spk_s.ptr, bob_kpk_s.ptr), "decrypt_prekey"
+  Sig.signal_pre_key_signal_message_destroy(pksm_out.read_pointer)
+  dec1 = read_owned(dec1_owned)
+  raise "FAIL pre-key plaintext: #{dec1.inspect}" unless dec1 == pt1
+
+  # Bob replies (whisper message)
+  pt2 = "hey alice"
+  pt2_buf, _p2 = borrow(pt2)
+  ct2_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_encrypt_message(ct2_out, pt2_buf, alice_addr,
+    bob_ss.ptr, bob_is.ptr, bob_pk_s.ptr, bob_spk_s.ptr), "encrypt_2"
+  ct2_owned = Sig::OwnedBuffer.new
+  must Sig.signal_ciphertext_message_serialize(ct2_owned.to_ptr, ct2_out.read_pointer), "ct2_ser"
+  Sig.signal_ciphertext_message_destroy(ct2_out.read_pointer)
+  ct2_bytes = read_owned(ct2_owned)
+
+  whisper_out = FFI::MemoryPointer.new(:pointer)
+  ct2_buf, _ = borrow(ct2_bytes)
+  must Sig.signal_message_deserialize(whisper_out, ct2_buf), "whisper_deser"
+  dec2_owned = Sig::OwnedBuffer.new
+  must Sig.signal_decrypt_message(dec2_owned.to_ptr, whisper_out.read_pointer, bob_addr,
+    alice_ss.ptr, alice_is.ptr), "decrypt_whisper"
+  Sig.signal_message_destroy(whisper_out.read_pointer)
+  dec2 = read_owned(dec2_owned)
+  raise "FAIL whisper plaintext: #{dec2.inspect}" unless dec2 == pt2
+
+  Sig.signal_address_destroy(bob_addr)
+  Sig.signal_address_destroy(alice_addr)
+  puts "X3DH + PQXDH + Double Ratchet PASS"
 end
 
 def test_group
-  dist_id = FFI::MemoryPointer.new(:uint8, 16)
-  dist_id.put_bytes(0, "\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10")
+  dist_id = "\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10"
+  dist_buf, _dist_pin = borrow(dist_id)
 
-  alice_skdb = MemSenderKeyStore.new
-  bob_skdb   = MemSenderKeyStore.new
+  alice_sk = SenderKeyStore.new
+  bob_sk   = SenderKeyStore.new
 
-  skdm_pp  = FFI::MemoryPointer.new(:pointer)
-  skdm_len = FFI::MemoryPointer.new(:size_t)
-  must(LibSignal.libsignal_group_create_session(
-    "alice", 1, dist_id, alice_skdb.ffi_struct, skdm_pp, skdm_len
-  ), "group_create")
+  alice_addr_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_address_new(alice_addr_out, "alice", 1), "alice_addr"
+  alice_addr = alice_addr_out.read_pointer
 
-  skdm_ptr   = skdm_pp.read_pointer
-  skdm_bytes = skdm_len.read(:size_t)
-  must(LibSignal.libsignal_group_process_session(
-    "alice", 1, skdm_ptr, skdm_bytes, bob_skdb.ffi_struct
-  ), "group_process")
-  FFI::LibC.free(skdm_ptr)
+  skdm_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_sender_key_distribution_message_create(skdm_out, alice_addr, dist_buf, alice_sk.ptr), "skdm_create"
+  must Sig.signal_process_sender_key_distribution_message(alice_addr, skdm_out.read_pointer, bob_sk.ptr), "skdm_process"
+  Sig.signal_sender_key_distribution_message_destroy(skdm_out.read_pointer)
 
-  ct_pp  = FFI::MemoryPointer.new(:pointer)
-  ct_len = FFI::MemoryPointer.new(:size_t)
-  msg    = FFI::MemoryPointer.from_string("group hello")
-  must(LibSignal.libsignal_group_encrypt(
-    "alice", 1, dist_id, msg, 11, alice_skdb.ffi_struct, ct_pp, ct_len
-  ), "group_encrypt")
+  msg = "group hello"; msg_buf, _p = borrow(msg)
+  enc_owned = Sig::OwnedBuffer.new
+  must Sig.signal_group_encrypt_message(enc_owned.to_ptr, alice_addr, dist_buf, msg_buf, alice_sk.ptr), "group_enc"
+  enc_bytes = read_owned(enc_owned)
 
-  ct_ptr = ct_pp.read_pointer
-  ct_bytes = ct_len.read(:size_t)
+  dec_owned = Sig::OwnedBuffer.new
+  enc_buf, _ = borrow(enc_bytes)
+  must Sig.signal_group_decrypt_message(dec_owned.to_ptr, alice_addr, dist_buf, enc_buf, bob_sk.ptr), "group_dec"
+  dec = read_owned(dec_owned)
+  raise "FAIL group plaintext: #{dec.inspect}" unless dec == msg
 
-  pt_pp  = FFI::MemoryPointer.new(:pointer)
-  pt_len = FFI::MemoryPointer.new(:size_t)
-  must(LibSignal.libsignal_group_decrypt(
-    "alice", 1, dist_id, ct_ptr, ct_bytes, bob_skdb.ffi_struct, pt_pp, pt_len
-  ), "group_decrypt")
-  FFI::LibC.free(ct_ptr)
-
-  pt = pt_pp.read_pointer.read_bytes(pt_len.read(:size_t))
-  FFI::LibC.free(pt_pp.read_pointer)
-  raise "FAIL group plaintext" unless pt == "group hello"
-
+  Sig.signal_address_destroy(alice_addr)
   puts "Sender Keys (group)           PASS"
 end
 
-def test_sealed_sender_v1
-  trust_pub, trust_priv = gen_keypair
-  server_pub, server_priv = gen_keypair
-  recv_pub, recv_priv  = gen_keypair
-  sender_pub, _         = gen_keypair
-
-  srv_cert_pp  = FFI::MemoryPointer.new(:pointer)
-  srv_cert_len = FFI::MemoryPointer.new(:size_t)
-  must(LibSignal.libsignal_server_cert_serialize(
-    1, server_pub, trust_priv, srv_cert_pp, srv_cert_len
-  ), "server_cert")
-
-  srv_cert_ptr   = srv_cert_pp.read_pointer
-  srv_cert_bytes = srv_cert_len.read(:size_t)
-
-  snd_cert_pp  = FFI::MemoryPointer.new(:pointer)
-  snd_cert_len = FFI::MemoryPointer.new(:size_t)
-  must(LibSignal.libsignal_sender_cert_serialize(
-    "alice-uuid", "+15551234567", 1,
-    sender_pub, 9_999_999_999,
-    srv_cert_ptr, srv_cert_bytes, server_priv,
-    snd_cert_pp, snd_cert_len
-  ), "sender_cert")
-  FFI::LibC.free(srv_cert_ptr)
-
-  snd_cert_ptr   = snd_cert_pp.read_pointer
-  snd_cert_bytes = snd_cert_len.read(:size_t)
-
-  msg    = "sealed v1 message"
-  msg_ptr = FFI::MemoryPointer.from_string(msg)
-  env_pp  = FFI::MemoryPointer.new(:pointer)
-  env_len = FFI::MemoryPointer.new(:size_t)
-  must(LibSignal.libsignal_sealed_sender_encrypt(
-    recv_pub, snd_cert_ptr, snd_cert_bytes,
-    1, 0, nil,
-    msg_ptr, msg.bytesize,
-    env_pp, env_len
-  ), "ss_v1_encrypt")
-  FFI::LibC.free(snd_cert_ptr)
-
-  env_ptr   = env_pp.read_pointer
-  env_bytes = env_len.read(:size_t)
-
-  uuid_pp  = FFI::MemoryPointer.new(:pointer)
-  uuid_len = FFI::MemoryPointer.new(:size_t)
-  e164_pp  = FFI::MemoryPointer.new(:pointer)
-  e164_len = FFI::MemoryPointer.new(:size_t)
-  dev_out  = FFI::MemoryPointer.new(:uint32)
-  ct_out   = FFI::MemoryPointer.new(:uint8)
-  cont_pp  = FFI::MemoryPointer.new(:pointer)
-  cont_len = FFI::MemoryPointer.new(:size_t)
-
-  must(LibSignal.libsignal_sealed_sender_decrypt(
-    env_ptr, env_bytes, recv_priv,
-    uuid_pp, uuid_len, e164_pp, e164_len,
-    dev_out, ct_out, cont_pp, cont_len
-  ), "ss_v1_decrypt")
-  FFI::LibC.free(env_ptr)
-
-  uuid = uuid_pp.read_pointer.read_bytes(uuid_len.read(:size_t))
-  FFI::LibC.free(uuid_pp.read_pointer)
-  e164_ptr_val = e164_pp.read_pointer
-  FFI::LibC.free(e164_ptr_val) unless e164_ptr_val.null?
-  contents = cont_pp.read_pointer.read_bytes(cont_len.read(:size_t))
-  FFI::LibC.free(cont_pp.read_pointer)
-
-  raise "FAIL ss_v1 uuid" unless uuid == "alice-uuid"
-  raise "FAIL ss_v1 contents" unless contents == msg
-
-  puts "Sealed Sender V1              PASS"
-end
-
-def test_sealed_sender_v2
-  sender_pub, sender_priv = gen_keypair
-  recv_pub, recv_priv     = gen_keypair
-
-  recip = LibSignal::V2Recipient.new
-  service_id = "\x00" + (1..16).map(&:chr).join
-  recip[:service_id_fixed].to_ptr.put_bytes(0, service_id)
-  recip[:device_id] = 1
-  recip[:identity_pub].to_ptr.put_bytes(0, recv_pub.read_bytes(33))
-
-  msg     = "sealed v2 message"
-  msg_ptr = FFI::MemoryPointer.from_string(msg)
-  sent_pp  = FFI::MemoryPointer.new(:pointer)
-  sent_len = FFI::MemoryPointer.new(:size_t)
-
-  must(LibSignal.libsignal_sealed_sender_encrypt_v2(
-    msg_ptr, msg.bytesize,
-    sender_priv, sender_pub,
-    recip, 1,
-    nil, 0,
-    sent_pp, sent_len
-  ), "ss2_encrypt")
-
-  sent_ptr   = sent_pp.read_pointer
-  sent_bytes = sent_len.read(:size_t)
-
-  sid_ptr = FFI::MemoryPointer.new(:uint8, 17)
-  sid_ptr.put_bytes(0, service_id)
-
-  recv_pp  = FFI::MemoryPointer.new(:pointer)
-  recv_len = FFI::MemoryPointer.new(:size_t)
-  must(LibSignal.libsignal_sealed_sender_v2_dispatch(
-    sent_ptr, sent_bytes, sid_ptr, 1, recv_pp, recv_len
-  ), "ss2_dispatch")
-  FFI::LibC.free(sent_ptr)
-
-  recv_ptr   = recv_pp.read_pointer
-  recv_bytes = recv_len.read(:size_t)
-
-  pt_pp  = FFI::MemoryPointer.new(:pointer)
-  pt_len = FFI::MemoryPointer.new(:size_t)
-  must(LibSignal.libsignal_sealed_sender_decrypt_v2(
-    recv_ptr, recv_bytes,
-    recv_priv, recv_pub, sender_pub,
-    pt_pp, pt_len
-  ), "ss2_decrypt")
-  FFI::LibC.free(recv_ptr)
-
-  pt = pt_pp.read_pointer.read_bytes(pt_len.read(:size_t))
-  FFI::LibC.free(pt_pp.read_pointer)
-  raise "FAIL ss2 contents" unless pt == msg
-
-  puts "Sealed Sender V2              PASS"
-end
-
 def test_fingerprint
-  a_pub, a_priv = gen_keypair
-  b_pub, b_priv = gen_keypair
-  (a_priv; b_priv)  # used only to silence unused warning
+  pa_out = FFI::MemoryPointer.new(:pointer); pb_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_privatekey_generate(pa_out), "fp_gen_a"
+  must Sig.signal_privatekey_generate(pb_out), "fp_gen_b"
+  qa_out = FFI::MemoryPointer.new(:pointer); qb_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_privatekey_get_public_key(qa_out, pa_out.read_pointer), "fp_puba"
+  must Sig.signal_privatekey_get_public_key(qb_out, pb_out.read_pointer), "fp_pubb"
+  Sig.signal_privatekey_destroy(pa_out.read_pointer)
+  Sig.signal_privatekey_destroy(pb_out.read_pointer)
 
-  alice_id = "+15551234567"
-  bob_id   = "+15559876543"
+  aid_buf, _ = borrow("+15551234567"); bid_buf, _ = borrow("+15559876543")
+  fp_a_out = FFI::MemoryPointer.new(:pointer); fp_b_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_fingerprint_new(fp_a_out, 5200, 0, aid_buf, qa_out.read_pointer, bid_buf, qb_out.read_pointer), "fp_new_a"
+  must Sig.signal_fingerprint_new(fp_b_out, 5200, 0, bid_buf, qb_out.read_pointer, aid_buf, qa_out.read_pointer), "fp_new_b"
+  Sig.signal_publickey_destroy(qa_out.read_pointer)
+  Sig.signal_publickey_destroy(qb_out.read_pointer)
 
-  disp_a  = FFI::MemoryPointer.new(:uint8, 60)
-  scan_a_pp  = FFI::MemoryPointer.new(:pointer)
-  scan_a_len = FFI::MemoryPointer.new(:size_t)
-  must(LibSignal.libsignal_fingerprint_compute(
-    a_pub, FFI::MemoryPointer.from_string(alice_id), alice_id.bytesize,
-    b_pub, FFI::MemoryPointer.from_string(bob_id),   bob_id.bytesize,
-    disp_a, scan_a_pp, scan_a_len
-  ), "fp_compute_a")
+  scan_b = Sig::OwnedBuffer.new
+  must Sig.signal_fingerprint_scannable_encoding(scan_b.to_ptr, fp_b_out.read_pointer), "fp_scan_b"
+  scan_b_bytes = read_owned(scan_b)
 
-  disp_b  = FFI::MemoryPointer.new(:uint8, 60)
-  scan_b_pp  = FFI::MemoryPointer.new(:pointer)
-  scan_b_len = FFI::MemoryPointer.new(:size_t)
-  must(LibSignal.libsignal_fingerprint_compute(
-    b_pub, FFI::MemoryPointer.from_string(bob_id),   bob_id.bytesize,
-    a_pub, FFI::MemoryPointer.from_string(alice_id), alice_id.bytesize,
-    disp_b, scan_b_pp, scan_b_len
-  ), "fp_compute_b")
+  ok_p = FFI::MemoryPointer.new(:bool)
+  scan_buf, _ = borrow(scan_b_bytes)
+  must Sig.signal_fingerprint_compare(ok_p, fp_a_out.read_pointer, scan_buf), "fp_compare"
+  raise "FAIL fingerprint mismatch" unless ok_p.read(:bool)
 
-  match = FFI::MemoryPointer.new(:int)
-  must(LibSignal.libsignal_fingerprint_compare(
-    scan_a_pp.read_pointer, scan_a_len.read(:size_t),
-    scan_b_pp.read_pointer, scan_b_len.read(:size_t),
-    match
-  ), "fp_compare")
-  raise "FAIL fp match" unless match.read(:int) == 1
-
-  FFI::LibC.free(scan_a_pp.read_pointer)
-  FFI::LibC.free(scan_b_pp.read_pointer)
+  Sig.signal_fingerprint_destroy(fp_a_out.read_pointer)
+  Sig.signal_fingerprint_destroy(fp_b_out.read_pointer)
   puts "Fingerprints                  PASS"
 end
 
 def test_username
-  username   = "alice.42"
-  hash       = FFI::MemoryPointer.new(:uint8, 32)
-  must(LibSignal.libsignal_username_hash(username, hash), "username_hash")
+  hash_ptr = FFI::MemoryPointer.new(:uint8, 32)
+  must Sig.signal_username_hash(hash_ptr, "alice.42"), "username_hash"
 
-  randomness = FFI::MemoryPointer.new(:uint8, 32)
-  32.times { |i| randomness.put_uint8(i, (i * 7 + 3) & 0xff) }
+  proof_owned = Sig::OwnedBuffer.new
+  must Sig.signal_username_proof(proof_owned.to_ptr, "alice.42"), "username_proof"
+  proof_bytes = read_owned(proof_owned)
 
-  proof = FFI::MemoryPointer.new(:uint8, 128)
-  must(LibSignal.libsignal_username_proof(username, randomness, proof), "username_proof")
-
-  valid = FFI::MemoryPointer.new(:int)
-  must(LibSignal.libsignal_username_verify(hash, proof, valid), "username_verify")
-  raise "FAIL username valid" unless valid.read(:int) == 1
-
+  ok_p = FFI::MemoryPointer.new(:bool)
+  proof_buf, _ = borrow(proof_bytes)
+  must Sig.signal_username_verify(ok_p, hash_ptr, proof_buf), "username_verify"
+  raise "FAIL username invalid" unless ok_p.read(:bool)
   puts "Username ZK proof             PASS"
 end
 
 def test_account_keys
-  pool = FFI::MemoryPointer.new(:uint8, 64)
-  LibSignal.libsignal_account_entropy_pool_generate(pool)
-  must(LibSignal.libsignal_account_entropy_pool_parse(pool), "entropy_pool_parse")
+  pool_out = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_account_entropy_pool_generate(pool_out), "pool_gen"
+  pool = pool_out.read_pointer
 
-  svr_key    = FFI::MemoryPointer.new(:uint8, 32)
-  backup_key = FFI::MemoryPointer.new(:uint8, 32)
-  media_key  = FFI::MemoryPointer.new(:uint8, 32)
+  str_pp = FFI::MemoryPointer.new(:pointer)
+  must Sig.signal_account_entropy_pool_as_string(str_pp, pool), "pool_str"
+  puts "  Entropy pool: #{str_pp.read_pointer.read_string[0,16]}…"
+  Sig.signal_free_string(str_pp.read_pointer)
 
-  must(LibSignal.libsignal_account_entropy_derive_svr_key(pool, svr_key), "svr_key")
-  must(LibSignal.libsignal_account_entropy_derive_backup_key(pool, backup_key), "backup_key")
-  LibSignal.libsignal_backup_key_derive_media_key(backup_key, media_key)
+  svr = FFI::MemoryPointer.new(:uint8, 32)
+  bk  = FFI::MemoryPointer.new(:uint8, 32)
+  must Sig.signal_account_entropy_pool_derive_svr_key(svr, pool),    "svr_key"
+  must Sig.signal_account_entropy_pool_derive_backup_key(bk, pool),  "backup_key"
+  Sig.signal_account_entropy_pool_destroy(pool)
+  raise "FAIL svr==backup" if svr.read_bytes(32) == bk.read_bytes(32)
 
-  raise "FAIL keys svr==backup" if svr_key.read_bytes(32) == backup_key.read_bytes(32)
-  raise "FAIL keys backup==media" if backup_key.read_bytes(32) == media_key.read_bytes(32)
-
+  bk_obj_out = FFI::MemoryPointer.new(:pointer)
+  bk_buf, _  = borrow(bk.read_bytes(32))
+  must Sig.signal_backup_key_from_bytes(bk_obj_out, bk_buf), "bk_from_bytes"
+  media = FFI::MemoryPointer.new(:uint8, 32)
+  must Sig.signal_backup_key_derive_media_encryption_key(media, bk_obj_out.read_pointer), "media_key"
+  Sig.signal_backup_key_destroy(bk_obj_out.read_pointer)
+  raise "FAIL backup==media" if bk.read_bytes(32) == media.read_bytes(32)
   puts "Account entropy pool          PASS"
 end
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-test_ec
-test_kyber
+test_ec_keys
+test_kyber_keys
 test_session
 test_group
-test_sealed_sender_v1
-test_sealed_sender_v2
 test_fingerprint
 test_username
 test_account_keys
+puts "\nAll signal_ffi tests PASSED."

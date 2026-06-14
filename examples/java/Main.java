@@ -1,6 +1,7 @@
-// Every C FFI function exported by libsignal-zig.
-// Each section exercises a real-world roundtrip: generate → use → verify.
-// Run with: ./run.sh
+// examples/java/Main.java — signal_ffi.h round-trip exerciser (Java + JNA)
+//
+// Each section exercises a real-world roundtrip through the signal_ffi API.
+// Run with:  ./run.sh
 import com.sun.jna.*;
 import com.sun.jna.ptr.*;
 import java.util.*;
@@ -8,681 +9,839 @@ import java.nio.file.*;
 
 public class Main {
 
-    // ── Library path ─────────────────────────────────────────────────────────
-
     static final String LIB_DIR = Paths.get(
         System.getProperty("user.dir"), "..", "..", "zig-out", "lib"
     ).toAbsolutePath().normalize().toString();
 
-    // ── Callback interfaces (C function pointer types) ────────────────────────
+    // ── OwnedBuffer / BorrowedBuffer ──────────────────────────────────────────
+    // signal_ffi.h passes these structs by value.  JNA ByValue subclasses handle that.
 
-    interface SessLoadCb extends Callback {
-        int invoke(Pointer ud, String name, int dev,
-                   PointerByReference out, LongByReference outLen);
-    }
-    interface SessStoreCb extends Callback {
-        int invoke(Pointer ud, String name, int dev, Pointer data, long len);
-    }
-    interface IdGetKpCb extends Callback {
-        int invoke(Pointer ud, Pointer pubOut, Pointer privOut);
-    }
-    interface IdGetRegCb extends Callback {
-        int invoke(Pointer ud, IntByReference out);
-    }
-    interface IdSaveCb extends Callback {
-        int invoke(Pointer ud, String name, int dev, Pointer pub);
-    }
-    interface IdTrustedCb extends Callback {
-        int invoke(Pointer ud, String name, int dev, Pointer pub, int direction);
-    }
-    interface PkLoadCb extends Callback {
-        int invoke(Pointer ud, int id, Pointer pubOut, Pointer privOut);
-    }
-    interface PkRemoveCb extends Callback {
-        int invoke(Pointer ud, int id);
-    }
-    interface SpkLoadCb extends Callback {
-        int invoke(Pointer ud, int id, Pointer pubOut, Pointer privOut,
-                   Pointer sigOut, LongByReference tsOut);
-    }
-    interface SkStoreCb extends Callback {
-        int invoke(Pointer ud, String name, int dev,
-                   Pointer dist, Pointer data, long len);
-    }
-    interface SkLoadCb extends Callback {
-        int invoke(Pointer ud, String name, int dev, Pointer dist,
-                   PointerByReference out, LongByReference outLen);
+    @Structure.FieldOrder({"base", "length"})
+    public static class OwnedBuffer extends Structure {
+        public Pointer base;
+        public long    length;   // size_t
+        public static class ByValue extends OwnedBuffer implements Structure.ByValue {}
+        public static class ByRef   extends OwnedBuffer implements Structure.ByReference {}
     }
 
-    // ── Store structs ─────────────────────────────────────────────────────────
-
-    @Structure.FieldOrder({"ud", "load", "store"})
-    public static class SessionStore extends Structure {
-        public Pointer    ud;
-        public SessLoadCb load;
-        public SessStoreCb store;
-        public static class ByValue extends SessionStore implements Structure.ByValue {}
+    @Structure.FieldOrder({"base", "length"})
+    public static class BorrowedBuffer extends Structure {
+        public Pointer base;
+        public long    length;
+        public static class ByValue extends BorrowedBuffer implements Structure.ByValue {}
     }
 
-    @Structure.FieldOrder({"ud", "get_keypair", "get_registration_id", "save_identity", "is_trusted"})
-    public static class IdentityStore extends Structure {
-        public Pointer    ud;
-        public IdGetKpCb  get_keypair;
-        public IdGetRegCb get_registration_id;
-        public IdSaveCb   save_identity;
-        public IdTrustedCb is_trusted;
-        public static class ByValue extends IdentityStore implements Structure.ByValue {}
+    static BorrowedBuffer.ByValue borrow(byte[] bytes) {
+        Memory m = new Memory(bytes.length);
+        m.write(0, bytes, 0, bytes.length);
+        BorrowedBuffer.ByValue b = new BorrowedBuffer.ByValue();
+        b.base   = m;
+        b.length = bytes.length;
+        return b;
     }
 
-    @Structure.FieldOrder({"ud", "load", "remove"})
-    public static class PreKeyStore extends Structure {
-        public Pointer   ud;
-        public PkLoadCb  load;
-        public PkRemoveCb remove;
-        public static class ByValue extends PreKeyStore implements Structure.ByValue {}
-    }
+    // ── Store callback interfaces ─────────────────────────────────────────────
+    // All Signal{Mut,Const}Pointer<T> structs contain exactly one pointer field.
+    // On arm64/x86-64 they are ABI-equivalent to a bare Pointer.
 
-    @Structure.FieldOrder({"ud", "load"})
-    public static class SignedPreKeyStore extends Structure {
-        public Pointer   ud;
-        public SpkLoadCb load;
-        public static class ByValue extends SignedPreKeyStore implements Structure.ByValue {}
-    }
-
-    @Structure.FieldOrder({"ud", "store", "load"})
-    public static class SenderKeyStore extends Structure {
-        public Pointer  ud;
-        public SkStoreCb store;
-        public SkLoadCb  load;
-        public static class ByValue extends SenderKeyStore implements Structure.ByValue {}
-    }
-
-    @Structure.FieldOrder({"service_id_fixed", "device_id", "identity_pub"})
-    public static class V2Recipient extends Structure {
-        public byte[] service_id_fixed = new byte[17];
-        public byte   device_id;
-        public byte[] identity_pub     = new byte[33];
-    }
+    interface SessLoadCb  extends Callback { Pointer invoke(Pointer out, Pointer addr, Pointer ud); }
+    interface SessStoreCb extends Callback { Pointer invoke(Pointer addr, Pointer rec, Pointer ud); }
+    interface IdGetKpCb   extends Callback { Pointer invoke(Pointer outPub, Pointer outPriv, Pointer ud); }
+    interface IdGetRegCb  extends Callback { Pointer invoke(Pointer out, Pointer ud); }
+    interface IdSaveCb    extends Callback { Pointer invoke(Pointer addr, Pointer key, Pointer ud); }
+    interface IdTrustedCb extends Callback { Pointer invoke(Pointer out, Pointer addr, Pointer key, int dir, Pointer ud); }
+    interface IdGetIdCb   extends Callback { Pointer invoke(Pointer out, Pointer addr, Pointer ud); }
+    interface PkLoadCb    extends Callback { Pointer invoke(Pointer out, int id, Pointer ud); }
+    interface PkStoreCb   extends Callback { Pointer invoke(int id, Pointer rec, Pointer ud); }
+    interface PkRemoveCb  extends Callback { Pointer invoke(int id, Pointer ud); }
+    interface SpkLoadCb   extends Callback { Pointer invoke(Pointer out, int id, Pointer ud); }
+    interface SpkStoreCb  extends Callback { Pointer invoke(int id, Pointer rec, Pointer ud); }
+    interface KpkLoadCb   extends Callback { Pointer invoke(Pointer out, int id, Pointer ud); }
+    interface KpkStoreCb  extends Callback { Pointer invoke(int id, Pointer rec, Pointer ud); }
+    interface KpkMarkCb   extends Callback { Pointer invoke(int id, Pointer ud); }
+    interface SkStoreCb   extends Callback { Pointer invoke(Pointer addr, Pointer dist, Pointer rec, Pointer ud); }
+    interface SkLoadCb    extends Callback { Pointer invoke(Pointer out, Pointer addr, Pointer dist, Pointer ud); }
 
     // ── Library interface ─────────────────────────────────────────────────────
 
     interface Lib extends Library {
-        int libsignal_ec_keypair_generate(Pointer pub_out, Pointer priv_out);
-        int libsignal_ec_dh(Pointer their_pub, Pointer our_priv, Pointer shared_out);
-        int libsignal_xeddsa_sign(Pointer priv, Pointer msg, long msg_len, Pointer sig_out);
-        int libsignal_xeddsa_verify(Pointer pub, Pointer msg, long msg_len, Pointer sig);
+        // Error
+        Pointer signal_error_get_message(PointerByReference out, Pointer err);
+        void    signal_error_free(Pointer err);
+        void    signal_free_buffer(Pointer buf, long len);
+        void    signal_free_string(Pointer s);
 
-        int libsignal_kyber1024_keypair_generate(Pointer pub_out, Pointer sec_out);
-        int libsignal_kyber1024_encaps(Pointer pub, Pointer ct_out, Pointer ss_out);
-        int libsignal_kyber1024_decaps(Pointer sec, Pointer ct, Pointer ss_out);
+        // EC keys
+        Pointer signal_privatekey_generate(PointerByReference out);
+        Pointer signal_privatekey_deserialize(PointerByReference out, BorrowedBuffer.ByValue bytes);
+        Pointer signal_privatekey_serialize(OwnedBuffer.ByRef out, Pointer obj);
+        Pointer signal_privatekey_get_public_key(PointerByReference out, Pointer obj);
+        Pointer signal_privatekey_agree(OwnedBuffer.ByRef out, Pointer priv, Pointer pub);
+        Pointer signal_privatekey_sign(OwnedBuffer.ByRef out, Pointer priv, BorrowedBuffer.ByValue msg);
+        Pointer signal_privatekey_destroy(Pointer obj);
+        Pointer signal_publickey_deserialize(PointerByReference out, BorrowedBuffer.ByValue bytes);
+        Pointer signal_publickey_serialize(OwnedBuffer.ByRef out, Pointer obj);
+        Pointer signal_publickey_verify(ByteByReference out, Pointer pub, BorrowedBuffer.ByValue msg, BorrowedBuffer.ByValue sig);
+        Pointer signal_publickey_destroy(Pointer obj);
 
-        Pointer libsignal_ctx_new(
-            String remote_name, int remote_device_id,
-            SessionStore.ByValue sess, IdentityStore.ByValue id,
-            PreKeyStore.ByValue pk, SignedPreKeyStore.ByValue spk,
-            Pointer kyber_store);
-        void libsignal_ctx_free(Pointer ctx);
+        // Address
+        Pointer signal_address_new(PointerByReference out, String name, int device_id);
+        Pointer signal_address_get_name(PointerByReference out, Pointer addr);
+        Pointer signal_address_get_device_id(IntByReference out, Pointer addr);
+        Pointer signal_address_destroy(Pointer obj);
 
-        int libsignal_process_prekey_bundle(
-            Pointer ctx, int registration_id,
-            int pre_key_id, Pointer pre_key_pub,
-            int signed_pre_key_id, Pointer spk_pub, Pointer spk_sig,
-            Pointer identity_pub,
-            int kyber_id, Pointer kyber_pub, Pointer kyber_sig);
+        // Pre-key records
+        Pointer signal_pre_key_record_new(PointerByReference out, int id, Pointer pub, Pointer priv);
+        Pointer signal_pre_key_record_serialize(OwnedBuffer.ByRef out, Pointer obj);
+        Pointer signal_pre_key_record_deserialize(PointerByReference out, BorrowedBuffer.ByValue bytes);
+        Pointer signal_pre_key_record_get_public_key(PointerByReference out, Pointer obj);
+        Pointer signal_pre_key_record_destroy(Pointer obj);
 
-        int libsignal_encrypt(
-            Pointer ctx, Pointer plaintext, long len,
-            PointerByReference ct_out, LongByReference ct_len_out,
-            IntByReference msg_type_out);
-        int libsignal_decrypt_prekey(
-            Pointer ctx, Pointer ct, long len,
-            PointerByReference pt_out, LongByReference pt_len_out);
-        int libsignal_decrypt(
-            Pointer ctx, Pointer ct, long len,
-            PointerByReference pt_out, LongByReference pt_len_out);
+        // Signed pre-key records
+        Pointer signal_signed_pre_key_record_new(PointerByReference out, int id, long ts,
+                    Pointer pub, Pointer priv, BorrowedBuffer.ByValue sig);
+        Pointer signal_signed_pre_key_record_serialize(OwnedBuffer.ByRef out, Pointer obj);
+        Pointer signal_signed_pre_key_record_deserialize(PointerByReference out, BorrowedBuffer.ByValue bytes);
+        Pointer signal_signed_pre_key_record_get_public_key(PointerByReference out, Pointer obj);
+        Pointer signal_signed_pre_key_record_get_signature(OwnedBuffer.ByRef out, Pointer obj);
+        Pointer signal_signed_pre_key_record_destroy(Pointer obj);
 
-        int libsignal_group_create_session(
-            String sender_name, int sender_device_id, Pointer distribution_id,
-            SenderKeyStore.ByValue sk_store,
-            PointerByReference skdm_out, LongByReference skdm_len_out);
-        int libsignal_group_process_session(
-            String sender_name, int sender_device_id,
-            Pointer skdm_bytes, long skdm_len,
-            SenderKeyStore.ByValue sk_store);
-        int libsignal_group_encrypt(
-            String sender_name, int sender_device_id, Pointer distribution_id,
-            Pointer plaintext, long len,
-            SenderKeyStore.ByValue sk_store,
-            PointerByReference ct_out, LongByReference ct_len_out);
-        int libsignal_group_decrypt(
-            String sender_name, int sender_device_id, Pointer distribution_id,
-            Pointer ciphertext, long len,
-            SenderKeyStore.ByValue sk_store,
-            PointerByReference pt_out, LongByReference pt_len_out);
+        // Kyber keys and records
+        Pointer signal_kyber_key_pair_generate(PointerByReference out);
+        Pointer signal_kyber_key_pair_get_public_key(PointerByReference out, Pointer kp);
+        Pointer signal_kyber_key_pair_get_secret_key(PointerByReference out, Pointer kp);
+        Pointer signal_kyber_key_pair_destroy(Pointer obj);
+        Pointer signal_kyber_public_key_serialize(OwnedBuffer.ByRef out, Pointer obj);
+        Pointer signal_kyber_public_key_destroy(Pointer obj);
+        Pointer signal_kyber_secret_key_serialize(OwnedBuffer.ByRef out, Pointer obj);
+        Pointer signal_kyber_secret_key_destroy(Pointer obj);
+        Pointer signal_kyber_pre_key_record_new(PointerByReference out, int id, long ts,
+                    Pointer kp, BorrowedBuffer.ByValue sig);
+        Pointer signal_kyber_pre_key_record_serialize(OwnedBuffer.ByRef out, Pointer obj);
+        Pointer signal_kyber_pre_key_record_deserialize(PointerByReference out, BorrowedBuffer.ByValue bytes);
+        Pointer signal_kyber_pre_key_record_get_public_key(PointerByReference out, Pointer obj);
+        Pointer signal_kyber_pre_key_record_get_signature(OwnedBuffer.ByRef out, Pointer obj);
+        Pointer signal_kyber_pre_key_record_destroy(Pointer obj);
 
-        int libsignal_server_cert_serialize(
-            int key_id, Pointer key_pub, Pointer trust_root_priv,
-            PointerByReference out, LongByReference out_len);
-        int libsignal_sender_cert_serialize(
-            String sender_uuid, String sender_e164, int sender_device_id,
-            Pointer sender_key_pub, long expiration,
-            Pointer server_cert_bytes, long server_cert_len,
-            Pointer server_key_priv,
-            PointerByReference out, LongByReference out_len);
-        int libsignal_sealed_sender_encrypt(
-            Pointer recipient_pub,
-            Pointer sender_cert_bytes, long sender_cert_len,
-            byte msg_type, byte content_hint, String group_id,
-            Pointer plaintext, long plaintext_len,
-            PointerByReference out, LongByReference out_len);
-        int libsignal_sealed_sender_decrypt(
-            Pointer data, long data_len, Pointer our_priv,
-            PointerByReference sender_uuid_out, LongByReference uuid_len_out,
-            PointerByReference sender_e164_out, LongByReference e164_len_out,
-            IntByReference sender_device_id_out,
-            ByteByReference content_type_out,
-            PointerByReference contents_out, LongByReference contents_len_out);
+        // Session record
+        Pointer signal_session_record_serialize(OwnedBuffer.ByRef out, Pointer obj);
+        Pointer signal_session_record_deserialize(PointerByReference out, BorrowedBuffer.ByValue bytes);
 
-        int libsignal_sealed_sender_encrypt_v2(
-            Pointer message, long message_len,
-            Pointer sender_priv, Pointer sender_pub,
-            V2Recipient recipients, long recipient_count,
-            Pointer excluded_sids, long excluded_count,
-            PointerByReference out, LongByReference out_len);
-        int libsignal_sealed_sender_v2_dispatch(
-            Pointer sent, long sent_len,
-            Pointer service_id_fixed, byte device_id,
-            PointerByReference out, LongByReference out_len);
-        int libsignal_sealed_sender_decrypt_v2(
-            Pointer received, long received_len,
-            Pointer our_priv, Pointer our_pub, Pointer sender_pub,
-            PointerByReference out, LongByReference out_len);
+        // Sender key record
+        Pointer signal_sender_key_record_serialize(OwnedBuffer.ByRef out, Pointer obj);
+        Pointer signal_sender_key_record_deserialize(PointerByReference out, BorrowedBuffer.ByValue bytes);
 
-        int libsignal_fingerprint_compute(
-            Pointer local_pub, Pointer local_stable_id, long local_stable_id_len,
-            Pointer remote_pub, Pointer remote_stable_id, long remote_stable_id_len,
-            Pointer displayable_out,
-            PointerByReference scannable_out, LongByReference scannable_len_out);
-        int libsignal_fingerprint_compare(
-            Pointer local_scannable, long local_len,
-            Pointer their_scannable, long their_len,
-            IntByReference match_out);
+        // Pre-key bundle
+        Pointer signal_pre_key_bundle_new(PointerByReference out,
+                    int reg_id, int device_id,
+                    int opk_id, boolean has_opk, Pointer opk_pub,
+                    int spk_id, Pointer spk_pub, BorrowedBuffer.ByValue spk_sig,
+                    Pointer id_pub,
+                    int kpk_id, boolean has_kpk, Pointer kpk_pub,
+                    BorrowedBuffer.ByValue kpk_sig);
+        Pointer signal_pre_key_bundle_destroy(Pointer obj);
 
-        int libsignal_username_hash(String username_z, Pointer hash_out);
-        int libsignal_username_proof(String username_z, Pointer randomness, Pointer proof_out);
-        int libsignal_username_verify(Pointer username_hash, Pointer proof, IntByReference valid_out);
+        // Session protocol
+        Pointer signal_process_prekey_bundle(Pointer bundle, Pointer addr,
+                    Pointer ss, Pointer is, Pointer pks, Pointer sks, Pointer kks);
+        Pointer signal_encrypt_message(PointerByReference out, BorrowedBuffer.ByValue pt,
+                    Pointer addr, Pointer ss, Pointer is, Pointer pks, Pointer sks);
+        Pointer signal_ciphertext_message_serialize(OwnedBuffer.ByRef out, Pointer obj);
+        Pointer signal_ciphertext_message_destroy(Pointer obj);
+        Pointer signal_pre_key_signal_message_deserialize(PointerByReference out, BorrowedBuffer.ByValue bytes);
+        Pointer signal_pre_key_signal_message_destroy(Pointer obj);
+        Pointer signal_decrypt_pre_key_message(OwnedBuffer.ByRef out, Pointer msg, Pointer addr,
+                    Pointer ss, Pointer is, Pointer pks, Pointer sks, Pointer kks);
+        Pointer signal_message_deserialize(PointerByReference out, BorrowedBuffer.ByValue bytes);
+        Pointer signal_message_destroy(Pointer obj);
+        Pointer signal_decrypt_message(OwnedBuffer.ByRef out, Pointer msg, Pointer addr,
+                    Pointer ss, Pointer is);
 
-        void libsignal_account_entropy_pool_generate(Pointer pool_out);
-        int  libsignal_account_entropy_pool_parse(Pointer pool_str);
-        int  libsignal_account_entropy_derive_svr_key(Pointer pool_str, Pointer key_out);
-        int  libsignal_account_entropy_derive_backup_key(Pointer pool_str, Pointer key_out);
-        void libsignal_backup_key_derive_media_key(Pointer backup_key, Pointer key_out);
+        // Group
+        Pointer signal_sender_key_distribution_message_create(PointerByReference out,
+                    Pointer addr, BorrowedBuffer.ByValue dist_id, Pointer sk_store);
+        Pointer signal_process_sender_key_distribution_message(Pointer addr, Pointer skdm, Pointer sk_store);
+        Pointer signal_group_encrypt_message(OwnedBuffer.ByRef out, Pointer addr,
+                    BorrowedBuffer.ByValue dist_id, BorrowedBuffer.ByValue pt, Pointer sk_store);
+        Pointer signal_group_decrypt_message(OwnedBuffer.ByRef out, Pointer addr,
+                    BorrowedBuffer.ByValue dist_id, BorrowedBuffer.ByValue ct, Pointer sk_store);
+        Pointer signal_sender_key_distribution_message_destroy(Pointer obj);
+
+        // Fingerprint
+        Pointer signal_fingerprint_new(PointerByReference out, int iterations, int version,
+                    BorrowedBuffer.ByValue local_id, Pointer local_key,
+                    BorrowedBuffer.ByValue remote_id, Pointer remote_key);
+        Pointer signal_fingerprint_scannable_encoding(OwnedBuffer.ByRef out, Pointer fp);
+        Pointer signal_fingerprint_compare(ByteByReference out, Pointer fp,
+                    BorrowedBuffer.ByValue their_scannable);
+        Pointer signal_fingerprint_destroy(Pointer obj);
+
+        // Username
+        Pointer signal_username_hash(Pointer hash_out32, String username);
+        Pointer signal_username_proof(OwnedBuffer.ByRef out, String username);
+        Pointer signal_username_verify(ByteByReference out, Pointer hash, BorrowedBuffer.ByValue proof);
+
+        // Account keys
+        Pointer signal_account_entropy_pool_generate(PointerByReference out);
+        Pointer signal_account_entropy_pool_as_string(PointerByReference out, Pointer pool);
+        Pointer signal_account_entropy_pool_derive_svr_key(Pointer out32, Pointer pool);
+        Pointer signal_account_entropy_pool_derive_backup_key(Pointer out32, Pointer pool);
+        Pointer signal_account_entropy_pool_destroy(Pointer obj);
+        Pointer signal_backup_key_from_bytes(PointerByReference out, BorrowedBuffer.ByValue bytes);
+        Pointer signal_backup_key_derive_media_encryption_key(Pointer out32, Pointer bk);
+        Pointer signal_backup_key_destroy(Pointer obj);
     }
 
     static Lib lib;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    static void must(int rc, String label) {
-        if (rc != 0) throw new RuntimeException("FAIL " + label + ": error " + rc);
+    static void must(Pointer err, String label) {
+        if (err == null) return;
+        PointerByReference msgPP = new PointerByReference();
+        lib.signal_error_get_message(msgPP, err);
+        Pointer msgP = msgPP.getValue();
+        String msg = msgP != null ? msgP.getString(0) : "(no message)";
+        lib.signal_error_free(err);
+        throw new RuntimeException("[FAIL] " + label + ": " + msg);
     }
 
-    static Memory[] genKeypair() {
-        Memory pub  = new Memory(33);
-        Memory priv = new Memory(32);
-        must(lib.libsignal_ec_keypair_generate(pub, priv), "ec_keypair_generate");
-        return new Memory[]{pub, priv};
+    static byte[] readOwned(OwnedBuffer.ByRef b) {
+        byte[] data = b.base.getByteArray(0, (int) b.length);
+        lib.signal_free_buffer(b.base, b.length);
+        return data;
     }
 
-    // Read a C malloc'd buffer from a PointerByReference + LongByReference and free it.
-    static byte[] readOut(PointerByReference ptr, LongByReference len) {
-        Pointer p = ptr.getValue();
-        int    n = (int) len.getValue();
-        byte[] b = p.getByteArray(0, n);
-        Native.free(Pointer.nativeValue(p));
-        return b;
+    static String addrKey(Pointer addr) {
+        PointerByReference namePP = new PointerByReference();
+        IntByReference     devP   = new IntByReference();
+        must(lib.signal_address_get_name(namePP, addr),      "addr_get_name");
+        must(lib.signal_address_get_device_id(devP, addr),   "addr_get_dev");
+        return namePP.getValue().getString(0) + ":" + devP.getValue();
     }
 
-    // Allocate a C malloc buffer from a Java byte array so C can free() it.
-    static Pointer mallocCopy(byte[] src) {
-        long addr = Native.malloc(src.length);
-        Pointer p = new Pointer(addr);
-        p.write(0, src, 0, src.length);
+    static byte[] signBytes(byte[] priv32, byte[] data) {
+        PointerByReference privOut = new PointerByReference();
+        must(lib.signal_privatekey_deserialize(privOut, borrow(priv32)), "sb_deser");
+        OwnedBuffer.ByRef sig = new OwnedBuffer.ByRef();
+        must(lib.signal_privatekey_sign(sig, privOut.getValue(), borrow(data)), "sb_sign");
+        lib.signal_privatekey_destroy(privOut.getValue());
+        return readOwned(sig);
+    }
+
+    // ── Store structs (8-pointer layout: ptr + up to 7 callbacks) ────────────
+    // Each signal_ffi store struct is: {user_data, cb0, cb1, ..., reserved=null}
+    // We allocate a pointer array and fill it in.
+
+    static Pointer makeSessionStore(Map<String, byte[]> db,
+                                     SessLoadCb load, SessStoreCb store) {
+        Pointer p = new Memory(4 * Native.POINTER_SIZE);
+        p.setPointer(0, null);
+        p.setPointer(Native.POINTER_SIZE,     CallbackReference.getFunctionPointer(load));
+        p.setPointer(2 * Native.POINTER_SIZE, CallbackReference.getFunctionPointer(store));
+        p.setPointer(3 * Native.POINTER_SIZE, null);
+        return p;
+    }
+    static Pointer makeIdentityStore(IdGetKpCb gkp, IdGetRegCb grg, IdSaveCb sv,
+                                      IdTrustedCb tr, IdGetIdCb gi) {
+        Pointer p = new Memory(7 * Native.POINTER_SIZE);
+        p.setPointer(0,                       null);
+        p.setPointer(Native.POINTER_SIZE,     CallbackReference.getFunctionPointer(gkp));
+        p.setPointer(2 * Native.POINTER_SIZE, CallbackReference.getFunctionPointer(grg));
+        p.setPointer(3 * Native.POINTER_SIZE, CallbackReference.getFunctionPointer(sv));
+        p.setPointer(4 * Native.POINTER_SIZE, CallbackReference.getFunctionPointer(tr));
+        p.setPointer(5 * Native.POINTER_SIZE, CallbackReference.getFunctionPointer(gi));
+        p.setPointer(6 * Native.POINTER_SIZE, null);
+        return p;
+    }
+    static Pointer makePreKeyStore(PkLoadCb ld, PkStoreCb st, PkRemoveCb rm) {
+        Pointer p = new Memory(5 * Native.POINTER_SIZE);
+        p.setPointer(0,                       null);
+        p.setPointer(Native.POINTER_SIZE,     CallbackReference.getFunctionPointer(ld));
+        p.setPointer(2 * Native.POINTER_SIZE, CallbackReference.getFunctionPointer(st));
+        p.setPointer(3 * Native.POINTER_SIZE, CallbackReference.getFunctionPointer(rm));
+        p.setPointer(4 * Native.POINTER_SIZE, null);
+        return p;
+    }
+    static Pointer makeSignedPreKeyStore(SpkLoadCb ld, SpkStoreCb st) {
+        Pointer p = new Memory(4 * Native.POINTER_SIZE);
+        p.setPointer(0,                       null);
+        p.setPointer(Native.POINTER_SIZE,     CallbackReference.getFunctionPointer(ld));
+        p.setPointer(2 * Native.POINTER_SIZE, CallbackReference.getFunctionPointer(st));
+        p.setPointer(3 * Native.POINTER_SIZE, null);
+        return p;
+    }
+    static Pointer makeKyberStore(KpkLoadCb ld, KpkStoreCb st, KpkMarkCb mk) {
+        Pointer p = new Memory(5 * Native.POINTER_SIZE);
+        p.setPointer(0,                       null);
+        p.setPointer(Native.POINTER_SIZE,     CallbackReference.getFunctionPointer(ld));
+        p.setPointer(2 * Native.POINTER_SIZE, CallbackReference.getFunctionPointer(st));
+        p.setPointer(3 * Native.POINTER_SIZE, CallbackReference.getFunctionPointer(mk));
+        p.setPointer(4 * Native.POINTER_SIZE, null);
+        return p;
+    }
+    static Pointer makeSenderKeyStore(SkStoreCb st, SkLoadCb ld) {
+        Pointer p = new Memory(4 * Native.POINTER_SIZE);
+        p.setPointer(0,                       null);
+        p.setPointer(Native.POINTER_SIZE,     CallbackReference.getFunctionPointer(st));
+        p.setPointer(2 * Native.POINTER_SIZE, CallbackReference.getFunctionPointer(ld));
+        p.setPointer(3 * Native.POINTER_SIZE, null);
         return p;
     }
 
-    // ── In-memory stores ──────────────────────────────────────────────────────
+    // ── Test helpers — build store objects that call back into signal_ffi ─────
 
-    static SessionStore.ByValue makeSessionStore(Map<String, byte[]> db) {
-        SessionStore s = new SessionStore();
-        s.ud = null;
-        s.load = (ud, name, dev, out, outLen) -> {
-            byte[] data = db.get(name + ":" + dev);
-            if (data == null) return -6;
-            out.setValue(mallocCopy(data));
-            outLen.setValue(data.length);
-            return 0;
-        };
-        s.store = (ud, name, dev, data, len) -> {
-            db.put(name + ":" + dev, data.getByteArray(0, (int) len));
-            return 0;
-        };
-        SessionStore.ByValue bv = new SessionStore.ByValue();
-        bv.ud    = s.ud;
-        bv.load  = s.load;
-        bv.store = s.store;
-        return bv;
+    static class SessDB {
+        final Map<String, byte[]> db = new HashMap<>();
+        final SessLoadCb  load;
+        final SessStoreCb store;
+        final Pointer     ptr;
+
+        SessDB() {
+            load = (out, addr, ud) -> {
+                byte[] data = db.get(addrKey(addr));
+                if (data == null) { out.setPointer(0, null); return null; }
+                PointerByReference recOut = new PointerByReference();
+                // call library from within callback — works in JNA
+                out.setPointer(0, null);
+                Pointer e = lib.signal_session_record_deserialize(recOut, borrow(data));
+                if (e != null) return e;
+                out.setPointer(0, recOut.getValue());
+                return null;
+            };
+            store = (addr, rec, ud) -> {
+                OwnedBuffer.ByRef b = new OwnedBuffer.ByRef();
+                Pointer e = lib.signal_session_record_serialize(b, rec);
+                if (e != null) return e;
+                db.put(addrKey(addr), b.base.getByteArray(0, (int) b.length));
+                lib.signal_free_buffer(b.base, b.length);
+                return null;
+            };
+            ptr = makeSessionStore(db, load, store);
+        }
     }
 
-    static IdentityStore.ByValue makeIdentityStore(byte[] pub, byte[] priv, int regId) {
-        IdentityStore s = new IdentityStore();
-        s.ud = null;
-        s.get_keypair = (ud, pubOut, privOut) -> {
-            pubOut.write(0, pub, 0, 33);
-            privOut.write(0, priv, 0, 32);
-            return 0;
-        };
-        s.get_registration_id = (ud, out) -> { out.setValue(regId); return 0; };
-        s.save_identity       = (ud, name, dev, p)         -> 0;
-        s.is_trusted          = (ud, name, dev, p, dir)    -> 1;
-        IdentityStore.ByValue bv = new IdentityStore.ByValue();
-        bv.ud                  = s.ud;
-        bv.get_keypair         = s.get_keypair;
-        bv.get_registration_id = s.get_registration_id;
-        bv.save_identity       = s.save_identity;
-        bv.is_trusted          = s.is_trusted;
-        return bv;
+    static class IdDB {
+        final byte[]      privBytes;
+        final int         regId;
+        final Map<String, byte[]> trusted = new HashMap<>();
+        final IdGetKpCb   getKp;
+        final IdGetRegCb  getReg;
+        final IdSaveCb    save;
+        final IdTrustedCb isTrusted;
+        final IdGetIdCb   getId;
+        final Pointer     ptr;
+
+        IdDB(byte[] privBytes, int regId) {
+            this.privBytes = privBytes;
+            this.regId     = regId;
+            getKp = (outPub, outPriv, ud) -> {
+                PointerByReference privOut = new PointerByReference();
+                Pointer e = lib.signal_privatekey_deserialize(privOut, borrow(privBytes));
+                if (e != null) return e;
+                PointerByReference pubOut = new PointerByReference();
+                e = lib.signal_privatekey_get_public_key(pubOut, privOut.getValue());
+                if (e != null) return e;
+                outPriv.setPointer(0, privOut.getValue());
+                outPub.setPointer(0, pubOut.getValue());
+                return null;
+            };
+            getReg    = (out, ud) -> { out.setInt(0, regId); return null; };
+            save      = (addr, key, ud) -> {
+                OwnedBuffer.ByRef b = new OwnedBuffer.ByRef();
+                Pointer e = lib.signal_publickey_serialize(b, key);
+                if (e != null) return e;
+                trusted.put(addrKey(addr), b.base.getByteArray(0, (int) b.length));
+                lib.signal_free_buffer(b.base, b.length);
+                return null;
+            };
+            isTrusted = (out, addr, key, dir, ud) -> { out.setByte(0, (byte) 1); return null; };
+            getId     = (out, addr, ud) -> {
+                byte[] data = trusted.get(addrKey(addr));
+                if (data == null) { out.setPointer(0, null); return null; }
+                PointerByReference pubOut = new PointerByReference();
+                Pointer e = lib.signal_publickey_deserialize(pubOut, borrow(data));
+                if (e != null) return e;
+                out.setPointer(0, pubOut.getValue());
+                return null;
+            };
+            ptr = makeIdentityStore(getKp, getReg, save, isTrusted, getId);
+        }
     }
 
-    static PreKeyStore.ByValue makePreKeyStore(int id, byte[] pub, byte[] priv) {
-        PreKeyStore s = new PreKeyStore();
-        s.ud = null;
-        s.load = (ud, keyId, pubOut, privOut) -> {
-            if (keyId != id) return -6;
-            pubOut.write(0, pub, 0, 33);
-            privOut.write(0, priv, 0, 32);
-            return 0;
-        };
-        s.remove = (ud, keyId) -> 0;
-        PreKeyStore.ByValue bv = new PreKeyStore.ByValue();
-        bv.ud     = s.ud;
-        bv.load   = s.load;
-        bv.remove = s.remove;
-        return bv;
+    static class PkDB {
+        final Map<Integer, byte[]> db = new HashMap<>();
+        final PkLoadCb   load;
+        final PkStoreCb  store;
+        final PkRemoveCb remove;
+        final Pointer    ptr;
+
+        PkDB() {
+            load = (out, id, ud) -> {
+                byte[] data = db.get(id);
+                if (data == null) { out.setPointer(0, null); return null; }
+                PointerByReference recOut = new PointerByReference();
+                Pointer e = lib.signal_pre_key_record_deserialize(recOut, borrow(data));
+                if (e != null) return e;
+                out.setPointer(0, recOut.getValue());
+                return null;
+            };
+            store = (id, rec, ud) -> {
+                OwnedBuffer.ByRef b = new OwnedBuffer.ByRef();
+                Pointer e = lib.signal_pre_key_record_serialize(b, rec);
+                if (e != null) return e;
+                db.put(id, b.base.getByteArray(0, (int) b.length));
+                lib.signal_free_buffer(b.base, b.length);
+                return null;
+            };
+            remove = (id, ud) -> null;
+            ptr = makePreKeyStore(load, store, remove);
+        }
     }
 
-    static SignedPreKeyStore.ByValue makeSignedPreKeyStore(int id, byte[] pub, byte[] priv, byte[] sig) {
-        SignedPreKeyStore s = new SignedPreKeyStore();
-        s.ud = null;
-        s.load = (ud, keyId, pubOut, privOut, sigOut, tsOut) -> {
-            if (keyId != id) return -6;
-            pubOut.write(0, pub, 0, 33);
-            privOut.write(0, priv, 0, 32);
-            sigOut.write(0, sig, 0, 64);
-            tsOut.setValue(1700000000L);
-            return 0;
-        };
-        SignedPreKeyStore.ByValue bv = new SignedPreKeyStore.ByValue();
-        bv.ud   = s.ud;
-        bv.load = s.load;
-        return bv;
+    static class SpkDB {
+        final Map<Integer, byte[]> db = new HashMap<>();
+        final SpkLoadCb  load;
+        final SpkStoreCb store;
+        final Pointer    ptr;
+
+        SpkDB() {
+            load = (out, id, ud) -> {
+                byte[] data = db.get(id);
+                if (data == null) { out.setPointer(0, null); return null; }
+                PointerByReference recOut = new PointerByReference();
+                Pointer e = lib.signal_signed_pre_key_record_deserialize(recOut, borrow(data));
+                if (e != null) return e;
+                out.setPointer(0, recOut.getValue());
+                return null;
+            };
+            store = (id, rec, ud) -> {
+                OwnedBuffer.ByRef b = new OwnedBuffer.ByRef();
+                Pointer e = lib.signal_signed_pre_key_record_serialize(b, rec);
+                if (e != null) return e;
+                db.put(id, b.base.getByteArray(0, (int) b.length));
+                lib.signal_free_buffer(b.base, b.length);
+                return null;
+            };
+            ptr = makeSignedPreKeyStore(load, store);
+        }
     }
 
-    static SenderKeyStore.ByValue makeSenderKeyStore(Map<String, byte[]> db) {
-        SenderKeyStore s = new SenderKeyStore();
-        s.ud = null;
-        s.store = (ud, name, dev, dist, data, len) -> {
-            String key = name + ":" + dev + ":" + hex(dist.getByteArray(0, 16));
-            db.put(key, data.getByteArray(0, (int) len));
-            return 0;
-        };
-        s.load = (ud, name, dev, dist, out, outLen) -> {
-            String key  = name + ":" + dev + ":" + hex(dist.getByteArray(0, 16));
-            byte[] data = db.get(key);
-            if (data == null) return -6;
-            out.setValue(mallocCopy(data));
-            outLen.setValue(data.length);
-            return 0;
-        };
-        SenderKeyStore.ByValue bv = new SenderKeyStore.ByValue();
-        bv.ud    = s.ud;
-        bv.store = s.store;
-        bv.load  = s.load;
-        return bv;
+    static class KpkDB {
+        final Map<Integer, byte[]> db = new HashMap<>();
+        final KpkLoadCb  load;
+        final KpkStoreCb store;
+        final KpkMarkCb  mark;
+        final Pointer    ptr;
+
+        KpkDB() {
+            load = (out, id, ud) -> {
+                byte[] data = db.get(id);
+                if (data == null) { out.setPointer(0, null); return null; }
+                PointerByReference recOut = new PointerByReference();
+                Pointer e = lib.signal_kyber_pre_key_record_deserialize(recOut, borrow(data));
+                if (e != null) return e;
+                out.setPointer(0, recOut.getValue());
+                return null;
+            };
+            store = (id, rec, ud) -> {
+                OwnedBuffer.ByRef b = new OwnedBuffer.ByRef();
+                Pointer e = lib.signal_kyber_pre_key_record_serialize(b, rec);
+                if (e != null) return e;
+                db.put(id, b.base.getByteArray(0, (int) b.length));
+                lib.signal_free_buffer(b.base, b.length);
+                return null;
+            };
+            mark = (id, ud) -> null;
+            ptr  = makeKyberStore(load, store, mark);
+        }
     }
 
-    static String hex(byte[] b) {
-        StringBuilder sb = new StringBuilder();
-        for (byte v : b) sb.append(String.format("%02x", v));
-        return sb.toString();
+    static class SkDB {
+        final Map<String, byte[]> db = new HashMap<>();
+        final SkStoreCb store;
+        final SkLoadCb  load;
+        final Pointer   ptr;
+
+        static String skKey(Pointer addr, Pointer dist) {
+            StringBuilder sb = new StringBuilder(addrKey(addr)).append(":");
+            byte[] d = dist.getByteArray(0, 16);
+            for (byte b : d) sb.append(String.format("%02x", b));
+            return sb.toString();
+        }
+
+        SkDB() {
+            store = (addr, dist, rec, ud) -> {
+                OwnedBuffer.ByRef b = new OwnedBuffer.ByRef();
+                Pointer e = lib.signal_sender_key_record_serialize(b, rec);
+                if (e != null) return e;
+                db.put(skKey(addr, dist), b.base.getByteArray(0, (int) b.length));
+                lib.signal_free_buffer(b.base, b.length);
+                return null;
+            };
+            load = (out, addr, dist, ud) -> {
+                byte[] data = db.get(skKey(addr, dist));
+                if (data == null) { out.setPointer(0, null); return null; }
+                PointerByReference recOut = new PointerByReference();
+                Pointer e = lib.signal_sender_key_record_deserialize(recOut, borrow(data));
+                if (e != null) return e;
+                out.setPointer(0, recOut.getValue());
+                return null;
+            };
+            ptr = makeSenderKeyStore(store, load);
+        }
+    }
+
+    // ── Bob setup ─────────────────────────────────────────────────────────────
+
+    static class BobKeys {
+        byte[] idPriv; int regId = 2002; int opkId = 1, spkId = 1, kpkId = 1;
+    }
+
+    static BobKeys setupBob(PkDB pkDb, SpkDB spkDb, KpkDB kpkDb) {
+        BobKeys b = new BobKeys();
+
+        PointerByReference idPrivOut = new PointerByReference();
+        must(lib.signal_privatekey_generate(idPrivOut), "bob_id_gen");
+        OwnedBuffer.ByRef idBytes = new OwnedBuffer.ByRef();
+        must(lib.signal_privatekey_serialize(idBytes, idPrivOut.getValue()), "bob_id_ser");
+        b.idPriv = readOwned(idBytes);
+        lib.signal_privatekey_destroy(idPrivOut.getValue());
+
+        // OPK
+        PointerByReference opkPriv = new PointerByReference(), opkPub = new PointerByReference();
+        must(lib.signal_privatekey_generate(opkPriv), "opk_gen");
+        must(lib.signal_privatekey_get_public_key(opkPub, opkPriv.getValue()), "opk_pub");
+        PointerByReference opkRec = new PointerByReference();
+        must(lib.signal_pre_key_record_new(opkRec, b.opkId, opkPub.getValue(), opkPriv.getValue()), "opk_rec");
+        lib.signal_privatekey_destroy(opkPriv.getValue());
+        lib.signal_publickey_destroy(opkPub.getValue());
+        OwnedBuffer.ByRef opkSer = new OwnedBuffer.ByRef();
+        must(lib.signal_pre_key_record_serialize(opkSer, opkRec.getValue()), "opk_ser");
+        pkDb.db.put(b.opkId, readOwned(opkSer));
+        lib.signal_pre_key_record_destroy(opkRec.getValue());
+
+        // SPK
+        PointerByReference spkPriv = new PointerByReference(), spkPub = new PointerByReference();
+        must(lib.signal_privatekey_generate(spkPriv), "spk_gen");
+        must(lib.signal_privatekey_get_public_key(spkPub, spkPriv.getValue()), "spk_pub");
+        OwnedBuffer.ByRef spkPubSer = new OwnedBuffer.ByRef();
+        must(lib.signal_publickey_serialize(spkPubSer, spkPub.getValue()), "spk_pub_ser");
+        byte[] spkSigBytes = signBytes(b.idPriv, readOwned(spkPubSer));
+        PointerByReference spkRec = new PointerByReference();
+        must(lib.signal_signed_pre_key_record_new(spkRec, b.spkId, 1700000000L,
+                spkPub.getValue(), spkPriv.getValue(), borrow(spkSigBytes)), "spk_rec");
+        lib.signal_privatekey_destroy(spkPriv.getValue());
+        lib.signal_publickey_destroy(spkPub.getValue());
+        OwnedBuffer.ByRef spkSer = new OwnedBuffer.ByRef();
+        must(lib.signal_signed_pre_key_record_serialize(spkSer, spkRec.getValue()), "spk_ser");
+        spkDb.db.put(b.spkId, readOwned(spkSer));
+        lib.signal_signed_pre_key_record_destroy(spkRec.getValue());
+
+        // KPK
+        PointerByReference kpk = new PointerByReference(), kpkPub = new PointerByReference();
+        must(lib.signal_kyber_key_pair_generate(kpk), "kpk_gen");
+        must(lib.signal_kyber_key_pair_get_public_key(kpkPub, kpk.getValue()), "kpk_pub");
+        OwnedBuffer.ByRef kpkPubSer = new OwnedBuffer.ByRef();
+        must(lib.signal_kyber_public_key_serialize(kpkPubSer, kpkPub.getValue()), "kpk_pub_ser");
+        byte[] kpkSigBytes = signBytes(b.idPriv, readOwned(kpkPubSer));
+        lib.signal_kyber_public_key_destroy(kpkPub.getValue());
+        PointerByReference kpkRec = new PointerByReference();
+        must(lib.signal_kyber_pre_key_record_new(kpkRec, b.kpkId, 1700000000L,
+                kpk.getValue(), borrow(kpkSigBytes)), "kpk_rec");
+        lib.signal_kyber_key_pair_destroy(kpk.getValue());
+        OwnedBuffer.ByRef kpkSer = new OwnedBuffer.ByRef();
+        must(lib.signal_kyber_pre_key_record_serialize(kpkSer, kpkRec.getValue()), "kpk_ser");
+        kpkDb.db.put(b.kpkId, readOwned(kpkSer));
+        lib.signal_kyber_pre_key_record_destroy(kpkRec.getValue());
+        return b;
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
 
     static void testEC() {
-        Memory[] a = genKeypair();
-        Memory[] b = genKeypair();
+        PointerByReference pa = new PointerByReference(), pb = new PointerByReference();
+        must(lib.signal_privatekey_generate(pa), "gen_a");
+        must(lib.signal_privatekey_generate(pb), "gen_b");
+        PointerByReference qa = new PointerByReference(), qb = new PointerByReference();
+        must(lib.signal_privatekey_get_public_key(qa, pa.getValue()), "pub_a");
+        must(lib.signal_privatekey_get_public_key(qb, pb.getValue()), "pub_b");
 
-        Memory sharedA = new Memory(32), sharedB = new Memory(32);
-        must(lib.libsignal_ec_dh(b[0], a[1], sharedA), "ec_dh_a");
-        must(lib.libsignal_ec_dh(a[0], b[1], sharedB), "ec_dh_b");
-        if (!Arrays.equals(sharedA.getByteArray(0, 32), sharedB.getByteArray(0, 32)))
-            throw new RuntimeException("FAIL ec_dh mismatch");
+        OwnedBuffer.ByRef dhA = new OwnedBuffer.ByRef(), dhB = new OwnedBuffer.ByRef();
+        must(lib.signal_privatekey_agree(dhA, pa.getValue(), qb.getValue()), "dh_a");
+        must(lib.signal_privatekey_agree(dhB, pb.getValue(), qa.getValue()), "dh_b");
+        if (!Arrays.equals(readOwned(dhA), readOwned(dhB)))
+            throw new RuntimeException("[FAIL] DH secrets differ");
 
-        byte[] msg    = "hello signal".getBytes();
-        Memory msgMem = new Memory(msg.length);
-        msgMem.write(0, msg, 0, msg.length);
-        Memory sig = new Memory(64);
-        must(lib.libsignal_xeddsa_sign(a[1], msgMem, msg.length, sig), "xeddsa_sign");
-        must(lib.libsignal_xeddsa_verify(a[0], msgMem, msg.length, sig), "xeddsa_verify");
+        byte[] msg = "hello signal".getBytes();
+        OwnedBuffer.ByRef sig = new OwnedBuffer.ByRef();
+        must(lib.signal_privatekey_sign(sig, pa.getValue(), borrow(msg)), "sign");
+        byte[] sigBytes = readOwned(sig);
+        ByteByReference ok = new ByteByReference();
+        must(lib.signal_publickey_verify(ok, qa.getValue(), borrow(msg), borrow(sigBytes)), "verify");
+        if (ok.getValue() == 0) throw new RuntimeException("[FAIL] XEdDSA verify failed");
 
+        lib.signal_privatekey_destroy(pa.getValue()); lib.signal_privatekey_destroy(pb.getValue());
+        lib.signal_publickey_destroy(qa.getValue());   lib.signal_publickey_destroy(qb.getValue());
         System.out.println("EC + XEdDSA                   PASS");
     }
 
     static void testKyber() {
-        Memory pk = new Memory(1568), sk = new Memory(3168);
-        must(lib.libsignal_kyber1024_keypair_generate(pk, sk), "kyber_keygen");
-
-        Memory ct = new Memory(1568), ssEnc = new Memory(32);
-        must(lib.libsignal_kyber1024_encaps(pk, ct, ssEnc), "kyber_encaps");
-
-        Memory ssDec = new Memory(32);
-        must(lib.libsignal_kyber1024_decaps(sk, ct, ssDec), "kyber_decaps");
-        if (!Arrays.equals(ssEnc.getByteArray(0, 32), ssDec.getByteArray(0, 32)))
-            throw new RuntimeException("FAIL kyber ss mismatch");
-
+        PointerByReference kp = new PointerByReference();
+        must(lib.signal_kyber_key_pair_generate(kp), "kyber_gen");
+        PointerByReference pub = new PointerByReference(), sec = new PointerByReference();
+        must(lib.signal_kyber_key_pair_get_public_key(pub, kp.getValue()), "kyber_pub");
+        must(lib.signal_kyber_key_pair_get_secret_key(sec, kp.getValue()), "kyber_sec");
+        OwnedBuffer.ByRef pubB = new OwnedBuffer.ByRef(), secB = new OwnedBuffer.ByRef();
+        must(lib.signal_kyber_public_key_serialize(pubB, pub.getValue()), "kyber_pub_ser");
+        must(lib.signal_kyber_secret_key_serialize(secB, sec.getValue()), "kyber_sec_ser");
+        if (pubB.length != 1568) throw new RuntimeException("[FAIL] Kyber pub size " + pubB.length);
+        if (secB.length != 3168) throw new RuntimeException("[FAIL] Kyber sec size " + secB.length);
+        lib.signal_free_buffer(pubB.base, pubB.length);
+        lib.signal_free_buffer(secB.base, secB.length);
+        lib.signal_kyber_key_pair_destroy(kp.getValue());
+        lib.signal_kyber_public_key_destroy(pub.getValue());
+        lib.signal_kyber_secret_key_destroy(sec.getValue());
         System.out.println("ML-KEM-1024 (Kyber)           PASS");
     }
 
     static void testSession() {
-        Memory[] aliceKp = genKeypair();
-        Memory[] bobKp   = genKeypair();
-        Memory[] bobOpk  = genKeypair();
-        Memory[] bobSpk  = genKeypair();
+        // Alice identity
+        PointerByReference alicePrivOut = new PointerByReference();
+        must(lib.signal_privatekey_generate(alicePrivOut), "alice_id_gen");
+        OwnedBuffer.ByRef aliceIdB = new OwnedBuffer.ByRef();
+        must(lib.signal_privatekey_serialize(aliceIdB, alicePrivOut.getValue()), "alice_id_ser");
+        byte[] aliceIdPriv = readOwned(aliceIdB);
+        lib.signal_privatekey_destroy(alicePrivOut.getValue());
 
-        Memory bobSpkSig = new Memory(64);
-        must(lib.libsignal_xeddsa_sign(bobKp[1], bobSpk[0], 33, bobSpkSig), "bob_spk_sig");
+        // Bob's stores and key material
+        PkDB  bobPk  = new PkDB();
+        SpkDB bobSpk = new SpkDB();
+        KpkDB bobKpk = new KpkDB();
+        BobKeys bob  = setupBob(bobPk, bobSpk, bobKpk);
 
-        Map<String, byte[]> aliceSessDB = new HashMap<>(), bobSessDB = new HashMap<>();
-        SessionStore.ByValue      aliceSess = makeSessionStore(aliceSessDB);
-        IdentityStore.ByValue     aliceId   = makeIdentityStore(aliceKp[0].getByteArray(0,33), aliceKp[1].getByteArray(0,32), 1001);
-        PreKeyStore.ByValue       alicePk   = makePreKeyStore(0, new byte[33], new byte[32]);
-        SignedPreKeyStore.ByValue  aliceSpk  = makeSignedPreKeyStore(0, new byte[33], new byte[32], new byte[64]);
+        // Bob's identity public key
+        PointerByReference bobPrivObj = new PointerByReference();
+        must(lib.signal_privatekey_deserialize(bobPrivObj, borrow(bob.idPriv)), "bob_id_deser");
+        PointerByReference bobIdPub = new PointerByReference();
+        must(lib.signal_privatekey_get_public_key(bobIdPub, bobPrivObj.getValue()), "bob_id_pub");
+        lib.signal_privatekey_destroy(bobPrivObj.getValue());
 
-        Pointer aliceCtx = lib.libsignal_ctx_new("bob", 1, aliceSess, aliceId, alicePk, aliceSpk, null);
-        if (aliceCtx == null) throw new RuntimeException("FAIL alice ctx_new");
+        // Load public keys + sigs from stores for the bundle
+        PointerByReference opkRec = new PointerByReference();
+        must(lib.signal_pre_key_record_deserialize(opkRec, borrow(bobPk.db.get(bob.opkId))), "opk_load");
+        PointerByReference opkPub = new PointerByReference();
+        must(lib.signal_pre_key_record_get_public_key(opkPub, opkRec.getValue()), "opk_pub");
+        lib.signal_pre_key_record_destroy(opkRec.getValue());
 
-        must(lib.libsignal_process_prekey_bundle(aliceCtx, 2002,
-            1, bobOpk[0], 1, bobSpk[0], bobSpkSig, bobKp[0], 0, null, null
-        ), "process_bundle");
+        PointerByReference spkRec = new PointerByReference();
+        must(lib.signal_signed_pre_key_record_deserialize(spkRec, borrow(bobSpk.db.get(bob.spkId))), "spk_load");
+        PointerByReference spkPub = new PointerByReference();
+        must(lib.signal_signed_pre_key_record_get_public_key(spkPub, spkRec.getValue()), "spk_pub");
+        OwnedBuffer.ByRef spkSigB = new OwnedBuffer.ByRef();
+        must(lib.signal_signed_pre_key_record_get_signature(spkSigB, spkRec.getValue()), "spk_sig");
+        byte[] spkSig = readOwned(spkSigB);
+        lib.signal_signed_pre_key_record_destroy(spkRec.getValue());
 
-        byte[] helloBytes = "hello bob".getBytes();
-        Memory helloMem = new Memory(helloBytes.length);
-        helloMem.write(0, helloBytes, 0, helloBytes.length);
-        PointerByReference ctPP   = new PointerByReference();
-        LongByReference    ctLen  = new LongByReference();
-        IntByReference     mtP    = new IntByReference();
-        must(lib.libsignal_encrypt(aliceCtx, helloMem, helloBytes.length, ctPP, ctLen, mtP), "encrypt_1");
-        byte[] ct = readOut(ctPP, ctLen);
+        PointerByReference kpkRec = new PointerByReference();
+        must(lib.signal_kyber_pre_key_record_deserialize(kpkRec, borrow(bobKpk.db.get(bob.kpkId))), "kpk_load");
+        PointerByReference kpkPub = new PointerByReference();
+        must(lib.signal_kyber_pre_key_record_get_public_key(kpkPub, kpkRec.getValue()), "kpk_pub");
+        OwnedBuffer.ByRef kpkSigB = new OwnedBuffer.ByRef();
+        must(lib.signal_kyber_pre_key_record_get_signature(kpkSigB, kpkRec.getValue()), "kpk_sig");
+        byte[] kpkSig = readOwned(kpkSigB);
+        lib.signal_kyber_pre_key_record_destroy(kpkRec.getValue());
 
-        SessionStore.ByValue      bobSess = makeSessionStore(bobSessDB);
-        IdentityStore.ByValue     bobId   = makeIdentityStore(bobKp[0].getByteArray(0,33), bobKp[1].getByteArray(0,32), 2002);
-        PreKeyStore.ByValue       bobPk   = makePreKeyStore(1, bobOpk[0].getByteArray(0,33), bobOpk[1].getByteArray(0,32));
-        SignedPreKeyStore.ByValue  bobSpkS = makeSignedPreKeyStore(1, bobSpk[0].getByteArray(0,33), bobSpk[1].getByteArray(0,32), bobSpkSig.getByteArray(0,64));
+        PointerByReference bundle = new PointerByReference();
+        must(lib.signal_pre_key_bundle_new(bundle,
+                bob.regId, 1,
+                bob.opkId, true, opkPub.getValue(),
+                bob.spkId, spkPub.getValue(), borrow(spkSig),
+                bobIdPub.getValue(),
+                bob.kpkId, true, kpkPub.getValue(), borrow(kpkSig)), "bundle_new");
+        lib.signal_publickey_destroy(opkPub.getValue());
+        lib.signal_publickey_destroy(spkPub.getValue());
+        lib.signal_kyber_public_key_destroy(kpkPub.getValue());
+        lib.signal_publickey_destroy(bobIdPub.getValue());
 
-        Pointer bobCtx = lib.libsignal_ctx_new("alice", 1, bobSess, bobId, bobPk, bobSpkS, null);
-        if (bobCtx == null) throw new RuntimeException("FAIL bob ctx_new");
+        // Addresses + Alice's stores
+        PointerByReference bobAddr   = new PointerByReference();
+        PointerByReference aliceAddr = new PointerByReference();
+        must(lib.signal_address_new(bobAddr,   "bob",   1), "bob_addr");
+        must(lib.signal_address_new(aliceAddr, "alice", 1), "alice_addr");
 
-        Memory ctMem = new Memory(ct.length);
-        ctMem.write(0, ct, 0, ct.length);
-        PointerByReference ptPP  = new PointerByReference();
-        LongByReference    ptLen = new LongByReference();
-        must(lib.libsignal_decrypt_prekey(bobCtx, ctMem, ct.length, ptPP, ptLen), "decrypt_prekey");
-        byte[] pt = readOut(ptPP, ptLen);
-        if (!Arrays.equals(pt, "hello bob".getBytes()))
-            throw new RuntimeException("FAIL session plaintext: " + new String(pt));
+        SessDB aliceSS  = new SessDB();
+        IdDB   aliceIS  = new IdDB(aliceIdPriv, 1001);
+        PkDB   alicePKS = new PkDB();
+        SpkDB  aliceSKS = new SpkDB();
+        KpkDB  aliceKKS = new KpkDB();
 
-        lib.libsignal_ctx_free(aliceCtx);
-        lib.libsignal_ctx_free(bobCtx);
-        System.out.println("X3DH + Double Ratchet         PASS");
+        must(lib.signal_process_prekey_bundle(bundle.getValue(), bobAddr.getValue(),
+                aliceSS.ptr, aliceIS.ptr, alicePKS.ptr, aliceSKS.ptr, aliceKKS.ptr), "proc_bundle");
+        lib.signal_pre_key_bundle_destroy(bundle.getValue());
+
+        // Alice encrypts
+        byte[] pt1 = "hello bob".getBytes();
+        PointerByReference ct1Out = new PointerByReference();
+        must(lib.signal_encrypt_message(ct1Out, borrow(pt1), bobAddr.getValue(),
+                aliceSS.ptr, aliceIS.ptr, alicePKS.ptr, aliceSKS.ptr), "enc_1");
+        OwnedBuffer.ByRef ct1B = new OwnedBuffer.ByRef();
+        must(lib.signal_ciphertext_message_serialize(ct1B, ct1Out.getValue()), "ct1_ser");
+        byte[] ct1Bytes = readOwned(ct1B);
+        lib.signal_ciphertext_message_destroy(ct1Out.getValue());
+
+        // Bob decrypts the pre-key message
+        SessDB bobSS = new SessDB();
+        IdDB   bobIS = new IdDB(bob.idPriv, bob.regId);
+
+        PointerByReference pksmOut = new PointerByReference();
+        must(lib.signal_pre_key_signal_message_deserialize(pksmOut, borrow(ct1Bytes)), "pksm_deser");
+        OwnedBuffer.ByRef dec1 = new OwnedBuffer.ByRef();
+        must(lib.signal_decrypt_pre_key_message(dec1, pksmOut.getValue(), aliceAddr.getValue(),
+                bobSS.ptr, bobIS.ptr, bobPk.ptr, bobSpk.ptr, bobKpk.ptr), "dec_prekey");
+        lib.signal_pre_key_signal_message_destroy(pksmOut.getValue());
+        if (!Arrays.equals(readOwned(dec1), pt1))
+            throw new RuntimeException("[FAIL] pre-key plaintext mismatch");
+
+        // Bob replies (whisper)
+        byte[] pt2 = "hey alice".getBytes();
+        PointerByReference ct2Out = new PointerByReference();
+        must(lib.signal_encrypt_message(ct2Out, borrow(pt2), aliceAddr.getValue(),
+                bobSS.ptr, bobIS.ptr, bobPk.ptr, bobSpk.ptr), "enc_2");
+        OwnedBuffer.ByRef ct2B = new OwnedBuffer.ByRef();
+        must(lib.signal_ciphertext_message_serialize(ct2B, ct2Out.getValue()), "ct2_ser");
+        byte[] ct2Bytes = readOwned(ct2B);
+        lib.signal_ciphertext_message_destroy(ct2Out.getValue());
+
+        PointerByReference whisperOut = new PointerByReference();
+        must(lib.signal_message_deserialize(whisperOut, borrow(ct2Bytes)), "whisper_deser");
+        OwnedBuffer.ByRef dec2 = new OwnedBuffer.ByRef();
+        must(lib.signal_decrypt_message(dec2, whisperOut.getValue(), bobAddr.getValue(),
+                aliceSS.ptr, aliceIS.ptr), "dec_whisper");
+        lib.signal_message_destroy(whisperOut.getValue());
+        if (!Arrays.equals(readOwned(dec2), pt2))
+            throw new RuntimeException("[FAIL] whisper plaintext mismatch");
+
+        lib.signal_address_destroy(bobAddr.getValue());
+        lib.signal_address_destroy(aliceAddr.getValue());
+        System.out.println("X3DH + PQXDH + Double Ratchet PASS");
     }
 
     static void testGroup() {
-        byte[] distId = {0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10};
-        Memory distMem = new Memory(16);
-        distMem.write(0, distId, 0, 16);
+        byte[] distId = {0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,
+                         0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10};
+        BorrowedBuffer.ByValue distBuf = borrow(distId);
 
-        Map<String, byte[]> aliceSkDB = new HashMap<>(), bobSkDB = new HashMap<>();
-        SenderKeyStore.ByValue aliceSk = makeSenderKeyStore(aliceSkDB);
-        SenderKeyStore.ByValue bobSk   = makeSenderKeyStore(bobSkDB);
+        PointerByReference aliceAddr = new PointerByReference();
+        must(lib.signal_address_new(aliceAddr, "alice", 1), "addr");
 
-        PointerByReference skdmPP  = new PointerByReference();
-        LongByReference    skdmLen = new LongByReference();
-        must(lib.libsignal_group_create_session("alice", 1, distMem, aliceSk, skdmPP, skdmLen), "group_create");
-        byte[] skdm = readOut(skdmPP, skdmLen);
+        SkDB aliceSK = new SkDB(), bobSK = new SkDB();
 
-        Memory skdmMem = new Memory(skdm.length);
-        skdmMem.write(0, skdm, 0, skdm.length);
-        must(lib.libsignal_group_process_session("alice", 1, skdmMem, skdm.length, bobSk), "group_process");
+        PointerByReference skdm = new PointerByReference();
+        must(lib.signal_sender_key_distribution_message_create(skdm, aliceAddr.getValue(),
+                distBuf, aliceSK.ptr), "skdm_create");
+        must(lib.signal_process_sender_key_distribution_message(aliceAddr.getValue(),
+                skdm.getValue(), bobSK.ptr), "skdm_proc");
+        lib.signal_sender_key_distribution_message_destroy(skdm.getValue());
 
         byte[] msg = "group hello".getBytes();
-        Memory msgMem = new Memory(msg.length);
-        msgMem.write(0, msg, 0, msg.length);
-        PointerByReference ctPP  = new PointerByReference();
-        LongByReference    ctLen = new LongByReference();
-        must(lib.libsignal_group_encrypt("alice", 1, distMem, msgMem, msg.length, aliceSk, ctPP, ctLen), "group_encrypt");
-        byte[] ct = readOut(ctPP, ctLen);
+        OwnedBuffer.ByRef enc = new OwnedBuffer.ByRef();
+        must(lib.signal_group_encrypt_message(enc, aliceAddr.getValue(), distBuf,
+                borrow(msg), aliceSK.ptr), "group_enc");
+        byte[] encBytes = readOwned(enc);
 
-        Memory ctMem = new Memory(ct.length);
-        ctMem.write(0, ct, 0, ct.length);
-        PointerByReference ptPP  = new PointerByReference();
-        LongByReference    ptLen = new LongByReference();
-        must(lib.libsignal_group_decrypt("alice", 1, distMem, ctMem, ct.length, bobSk, ptPP, ptLen), "group_decrypt");
-        byte[] pt = readOut(ptPP, ptLen);
-        if (!Arrays.equals(pt, "group hello".getBytes()))
-            throw new RuntimeException("FAIL group plaintext: " + new String(pt));
-
+        OwnedBuffer.ByRef dec = new OwnedBuffer.ByRef();
+        must(lib.signal_group_decrypt_message(dec, aliceAddr.getValue(),
+                distBuf, borrow(encBytes), bobSK.ptr), "group_dec");
+        if (!Arrays.equals(readOwned(dec), msg))
+            throw new RuntimeException("[FAIL] group plaintext mismatch");
+        lib.signal_address_destroy(aliceAddr.getValue());
         System.out.println("Sender Keys (group)           PASS");
     }
 
-    static void testSealedSenderV1() {
-        Memory[] trustKp  = genKeypair();
-        Memory[] serverKp = genKeypair();
-        Memory[] recvKp   = genKeypair();
-        Memory[] senderKp = genKeypair();
-
-        PointerByReference srvCertPP  = new PointerByReference();
-        LongByReference    srvCertLen = new LongByReference();
-        must(lib.libsignal_server_cert_serialize(1, serverKp[0], trustKp[1], srvCertPP, srvCertLen), "server_cert");
-        byte[] srvCert = readOut(srvCertPP, srvCertLen);
-
-        Memory srvCertMem = new Memory(srvCert.length);
-        srvCertMem.write(0, srvCert, 0, srvCert.length);
-        PointerByReference sndCertPP  = new PointerByReference();
-        LongByReference    sndCertLen = new LongByReference();
-        must(lib.libsignal_sender_cert_serialize(
-            "alice-uuid", "+15551234567", 1, senderKp[0],
-            9_999_999_999L, srvCertMem, srvCert.length, serverKp[1],
-            sndCertPP, sndCertLen), "sender_cert");
-        byte[] sndCert = readOut(sndCertPP, sndCertLen);
-
-        byte[] msg = "sealed v1 message".getBytes();
-        Memory msgMem     = new Memory(msg.length);
-        Memory sndCertMem = new Memory(sndCert.length);
-        msgMem.write(0, msg, 0, msg.length);
-        sndCertMem.write(0, sndCert, 0, sndCert.length);
-        PointerByReference envPP  = new PointerByReference();
-        LongByReference    envLen = new LongByReference();
-        must(lib.libsignal_sealed_sender_encrypt(
-            recvKp[0], sndCertMem, sndCert.length,
-            (byte) 1, (byte) 0, null,
-            msgMem, msg.length, envPP, envLen), "ss_v1_encrypt");
-        byte[] envelope = readOut(envPP, envLen);
-
-        Memory envMem = new Memory(envelope.length);
-        envMem.write(0, envelope, 0, envelope.length);
-        PointerByReference uuidPP   = new PointerByReference();
-        LongByReference    uuidLen  = new LongByReference();
-        PointerByReference e164PP   = new PointerByReference();
-        LongByReference    e164Len  = new LongByReference();
-        IntByReference     devOut   = new IntByReference();
-        ByteByReference    ctypeOut = new ByteByReference();
-        PointerByReference contPP   = new PointerByReference();
-        LongByReference    contLen  = new LongByReference();
-        must(lib.libsignal_sealed_sender_decrypt(
-            envMem, envelope.length, recvKp[1],
-            uuidPP, uuidLen, e164PP, e164Len,
-            devOut, ctypeOut, contPP, contLen), "ss_v1_decrypt");
-
-        byte[] uuid = readOut(uuidPP, uuidLen);
-        Pointer e164Ptr = e164PP.getValue();
-        if (e164Ptr != null) Native.free(Pointer.nativeValue(e164Ptr));
-        byte[] contents = readOut(contPP, contLen);
-
-        if (!new String(uuid).equals("alice-uuid"))
-            throw new RuntimeException("FAIL ss_v1 uuid: " + new String(uuid));
-        if (!Arrays.equals(contents, msg))
-            throw new RuntimeException("FAIL ss_v1 contents");
-
-        System.out.println("Sealed Sender V1              PASS");
-    }
-
-    static void testSealedSenderV2() {
-        Memory[] senderKp = genKeypair();
-        Memory[] recvKp   = genKeypair();
-
-        V2Recipient recip = new V2Recipient();
-        recip.service_id_fixed[0] = 0x00; // ACI
-        for (int i = 1; i < 17; i++) recip.service_id_fixed[i] = (byte) i;
-        recip.device_id = 1;
-        byte[] recvPubBytes = recvKp[0].getByteArray(0, 33);
-        System.arraycopy(recvPubBytes, 0, recip.identity_pub, 0, 33);
-
-        byte[] msg = "sealed v2 message".getBytes();
-        Memory msgMem = new Memory(msg.length);
-        msgMem.write(0, msg, 0, msg.length);
-        PointerByReference sentPP  = new PointerByReference();
-        LongByReference    sentLen = new LongByReference();
-        must(lib.libsignal_sealed_sender_encrypt_v2(
-            msgMem, msg.length,
-            senderKp[1], senderKp[0],
-            recip, 1,
-            null, 0,
-            sentPP, sentLen), "ss2_encrypt");
-        byte[] sent = readOut(sentPP, sentLen);
-
-        Memory sentMem = new Memory(sent.length);
-        sentMem.write(0, sent, 0, sent.length);
-        Memory sidMem = new Memory(17);
-        sidMem.write(0, recip.service_id_fixed, 0, 17);
-        PointerByReference recvPP  = new PointerByReference();
-        LongByReference    recvLen = new LongByReference();
-        must(lib.libsignal_sealed_sender_v2_dispatch(
-            sentMem, sent.length, sidMem, (byte) 1, recvPP, recvLen), "ss2_dispatch");
-        byte[] received = readOut(recvPP, recvLen);
-
-        Memory rcvMem = new Memory(received.length);
-        rcvMem.write(0, received, 0, received.length);
-        PointerByReference ptPP  = new PointerByReference();
-        LongByReference    ptLen = new LongByReference();
-        must(lib.libsignal_sealed_sender_decrypt_v2(
-            rcvMem, received.length,
-            recvKp[1], recvKp[0], senderKp[0],
-            ptPP, ptLen), "ss2_decrypt");
-        byte[] pt = readOut(ptPP, ptLen);
-        if (!Arrays.equals(pt, msg))
-            throw new RuntimeException("FAIL ss2 contents: " + new String(pt));
-
-        System.out.println("Sealed Sender V2              PASS");
-    }
-
     static void testFingerprint() {
-        Memory[] a = genKeypair();
-        Memory[] b = genKeypair();
+        PointerByReference pa = new PointerByReference(), pb = new PointerByReference();
+        must(lib.signal_privatekey_generate(pa), "gen_a");
+        must(lib.signal_privatekey_generate(pb), "gen_b");
+        PointerByReference qa = new PointerByReference(), qb = new PointerByReference();
+        must(lib.signal_privatekey_get_public_key(qa, pa.getValue()), "pub_a");
+        must(lib.signal_privatekey_get_public_key(qb, pb.getValue()), "pub_b");
+        lib.signal_privatekey_destroy(pa.getValue()); lib.signal_privatekey_destroy(pb.getValue());
 
-        byte[] aliceId = "+15551234567".getBytes();
-        byte[] bobId   = "+15559876543".getBytes();
-        Memory aliceIdMem = new Memory(aliceId.length); aliceIdMem.write(0, aliceId, 0, aliceId.length);
-        Memory bobIdMem   = new Memory(bobId.length);   bobIdMem.write(0, bobId, 0, bobId.length);
+        byte[] aId = "+15551234567".getBytes(), bId = "+15559876543".getBytes();
+        PointerByReference fpA = new PointerByReference(), fpB = new PointerByReference();
+        must(lib.signal_fingerprint_new(fpA, 5200, 0, borrow(aId), qa.getValue(),
+                borrow(bId), qb.getValue()), "fp_new_a");
+        must(lib.signal_fingerprint_new(fpB, 5200, 0, borrow(bId), qb.getValue(),
+                borrow(aId), qa.getValue()), "fp_new_b");
+        lib.signal_publickey_destroy(qa.getValue()); lib.signal_publickey_destroy(qb.getValue());
 
-        Memory dispA = new Memory(60), dispB = new Memory(60);
-        PointerByReference scanAPP  = new PointerByReference(); LongByReference scanALen = new LongByReference();
-        PointerByReference scanBPP  = new PointerByReference(); LongByReference scanBLen = new LongByReference();
+        OwnedBuffer.ByRef scanB = new OwnedBuffer.ByRef();
+        must(lib.signal_fingerprint_scannable_encoding(scanB, fpB.getValue()), "fp_scan_b");
+        byte[] scanBBytes = readOwned(scanB);
 
-        must(lib.libsignal_fingerprint_compute(
-            a[0], aliceIdMem, aliceId.length, b[0], bobIdMem, bobId.length,
-            dispA, scanAPP, scanALen), "fp_compute_a");
-        byte[] scanA = readOut(scanAPP, scanALen);
+        ByteByReference match = new ByteByReference();
+        must(lib.signal_fingerprint_compare(match, fpA.getValue(), borrow(scanBBytes)), "fp_compare");
+        if (match.getValue() == 0) throw new RuntimeException("[FAIL] fingerprint mismatch");
 
-        must(lib.libsignal_fingerprint_compute(
-            b[0], bobIdMem, bobId.length, a[0], aliceIdMem, aliceId.length,
-            dispB, scanBPP, scanBLen), "fp_compute_b");
-        byte[] scanB = readOut(scanBPP, scanBLen);
-
-        Memory scanAMem = new Memory(scanA.length); scanAMem.write(0, scanA, 0, scanA.length);
-        Memory scanBMem = new Memory(scanB.length); scanBMem.write(0, scanB, 0, scanB.length);
-        IntByReference match = new IntByReference();
-        must(lib.libsignal_fingerprint_compare(
-            scanAMem, scanA.length, scanBMem, scanB.length, match), "fp_compare");
-        if (match.getValue() != 1) throw new RuntimeException("FAIL fingerprint mismatch");
-
+        lib.signal_fingerprint_destroy(fpA.getValue());
+        lib.signal_fingerprint_destroy(fpB.getValue());
         System.out.println("Fingerprints                  PASS");
     }
 
     static void testUsername() {
         Memory hash = new Memory(32);
-        must(lib.libsignal_username_hash("alice.42", hash), "username_hash");
-
-        Memory randomness = new Memory(32);
-        for (int i = 0; i < 32; i++) randomness.setByte(i, (byte)((i * 7 + 3) & 0xff));
-
-        Memory proof = new Memory(128);
-        must(lib.libsignal_username_proof("alice.42", randomness, proof), "username_proof");
-
-        IntByReference valid = new IntByReference();
-        must(lib.libsignal_username_verify(hash, proof, valid), "username_verify");
-        if (valid.getValue() != 1) throw new RuntimeException("FAIL username invalid");
-
+        must(lib.signal_username_hash(hash, "alice.42"), "hash");
+        OwnedBuffer.ByRef proof = new OwnedBuffer.ByRef();
+        must(lib.signal_username_proof(proof, "alice.42"), "proof");
+        byte[] proofBytes = readOwned(proof);
+        ByteByReference valid = new ByteByReference();
+        must(lib.signal_username_verify(valid, hash, borrow(proofBytes)), "verify");
+        if (valid.getValue() == 0) throw new RuntimeException("[FAIL] username invalid");
         System.out.println("Username ZK proof             PASS");
     }
 
     static void testAccountKeys() {
-        Memory pool = new Memory(64);
-        lib.libsignal_account_entropy_pool_generate(pool);
-        must(lib.libsignal_account_entropy_pool_parse(pool), "entropy_pool_parse");
+        PointerByReference pool = new PointerByReference();
+        must(lib.signal_account_entropy_pool_generate(pool), "pool_gen");
 
-        Memory svrKey    = new Memory(32);
-        Memory backupKey = new Memory(32);
-        Memory mediaKey  = new Memory(32);
-        must(lib.libsignal_account_entropy_derive_svr_key(pool, svrKey), "svr_key");
-        must(lib.libsignal_account_entropy_derive_backup_key(pool, backupKey), "backup_key");
-        lib.libsignal_backup_key_derive_media_key(backupKey, mediaKey);
+        PointerByReference strPP = new PointerByReference();
+        must(lib.signal_account_entropy_pool_as_string(strPP, pool.getValue()), "pool_str");
+        String s = strPP.getValue().getString(0);
+        System.out.println("  Entropy pool: " + s.substring(0, Math.min(16, s.length())) + "…");
+        lib.signal_free_string(strPP.getValue());
 
-        if (Arrays.equals(svrKey.getByteArray(0,32), backupKey.getByteArray(0,32)))
-            throw new RuntimeException("FAIL svr==backup");
-        if (Arrays.equals(backupKey.getByteArray(0,32), mediaKey.getByteArray(0,32)))
-            throw new RuntimeException("FAIL backup==media");
+        Memory svr = new Memory(32), bk = new Memory(32);
+        must(lib.signal_account_entropy_pool_derive_svr_key(svr, pool.getValue()),    "svr_key");
+        must(lib.signal_account_entropy_pool_derive_backup_key(bk, pool.getValue()), "bk_key");
+        lib.signal_account_entropy_pool_destroy(pool.getValue());
+        if (Arrays.equals(svr.getByteArray(0, 32), bk.getByteArray(0, 32)))
+            throw new RuntimeException("[FAIL] svr==backup");
 
+        PointerByReference bkObj = new PointerByReference();
+        must(lib.signal_backup_key_from_bytes(bkObj, borrow(bk.getByteArray(0, 32))), "bk_from_bytes");
+        Memory media = new Memory(32);
+        must(lib.signal_backup_key_derive_media_encryption_key(media, bkObj.getValue()), "media_key");
+        lib.signal_backup_key_destroy(bkObj.getValue());
+        if (Arrays.equals(bk.getByteArray(0, 32), media.getByteArray(0, 32)))
+            throw new RuntimeException("[FAIL] backup==media");
         System.out.println("Account entropy pool          PASS");
     }
 
     // ── Main ──────────────────────────────────────────────────────────────────
 
     public static void main(String[] args) {
-        String libExt  = System.getProperty("os.name").toLowerCase().contains("mac") ? "dylib" : "so";
-        String libPath = LIB_DIR + "/libsignal." + libExt;
-
-        Map<String, Object> opts = new HashMap<>();
-        lib = Native.load(libPath, Lib.class, opts);
+        String ext     = System.getProperty("os.name").toLowerCase().contains("mac") ? "dylib" : "so";
+        String libPath = LIB_DIR + "/libsignal_ffi." + ext;
+        lib = Native.load(libPath, Lib.class, Collections.emptyMap());
 
         testEC();
         testKyber();
         testSession();
         testGroup();
-        testSealedSenderV1();
-        testSealedSenderV2();
         testFingerprint();
         testUsername();
         testAccountKeys();
+        System.out.println("\nAll signal_ffi tests PASSED.");
     }
 }

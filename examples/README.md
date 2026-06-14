@@ -12,15 +12,15 @@ zig build                        # debug
 zig build -Doptimize=ReleaseFast # optimized
 ```
 
-This produces `zig-out/lib/libsignal.dylib` (or `.so` on Linux) that every
+This produces `zig-out/lib/libsignal_ffi.dylib` (or `.so` on Linux) that every
 example links against.
 
 ---
 
 | Example | Language | FFI mechanism | Details |
 |---------|----------|---------------|---------|
-| [`c/`](c/) | C99 | direct `#include` of `libsignal.h` | [README](c/README.md) |
-| [`cpp/`](cpp/) | C++ 17 | direct `#include` of `libsignal.h` | [README](cpp/README.md) |
+| [`c/`](c/) | C99 | direct `#include` of `signal_ffi.h` | [README](c/README.md) |
+| [`cpp/`](cpp/) | C++ 17 | direct `#include` of `signal_ffi.h` | [README](cpp/README.md) |
 | [`go/`](go/) | Go | CGo | [README](go/README.md) |
 | [`java/`](java/) | Java 17+ | JNA 5.14 | [README](java/README.md) |
 | [`ruby/`](ruby/) | Ruby 3+ | `ffi` gem | [README](ruby/README.md) |

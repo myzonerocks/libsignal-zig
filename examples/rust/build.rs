@@ -8,6 +8,6 @@ fn main() {
         .expect("zig-out/lib not found — run `zig build` from the repo root first");
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    println!("cargo:rustc-link-lib=dylib=signal");
+    println!("cargo:rustc-link-lib=dylib=signal_ffi");
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
 }

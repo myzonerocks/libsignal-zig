@@ -1,6 +1,6 @@
 # C example
 
-Pure C99. No external dependencies beyond `libsignal.h` and a C compiler.
+Pure C99. No external dependencies beyond `signal_ffi.h` and a C compiler.
 
 ## Prerequisites
 
@@ -17,39 +17,32 @@ make run
 
 | Section | API exercised |
 |---------|---------------|
-| EC + XEdDSA | `libsignal_ec_keypair_generate`, `libsignal_ec_dh`, `libsignal_xeddsa_sign/verify` |
-| ML-KEM-1024 | `libsignal_kyber1024_keypair_generate`, `_encaps`, `_decaps` |
-| X3DH + Double Ratchet | `libsignal_ctx_new`, `libsignal_process_prekey_bundle`, `libsignal_encrypt`, `libsignal_decrypt_prekey`, `libsignal_decrypt` |
-| Sender Keys | `libsignal_group_create_session`, `_process_session`, `_encrypt`, `_decrypt` |
-| Sealed Sender V1 | `libsignal_server_cert_serialize`, `libsignal_sender_cert_serialize`, `libsignal_sealed_sender_encrypt/decrypt` |
-| Sealed Sender V2 | `libsignal_sealed_sender_encrypt_v2`, `_v2_dispatch`, `_decrypt_v2` |
-| Fingerprints | `libsignal_fingerprint_compute`, `libsignal_fingerprint_compare` |
-| Username ZK proof | `libsignal_username_hash`, `libsignal_username_proof`, `libsignal_username_verify` |
-| Account entropy pool | `libsignal_account_entropy_pool_generate`, `_parse`, `_derive_svr_key`, `_derive_backup_key`, `libsignal_backup_key_derive_media_key` |
+| EC + XEdDSA | `signal_privatekey_generate`, `signal_privatekey_agree`, `signal_privatekey_sign`, `signal_publickey_verify` |
+| ML-KEM-1024 | `signal_kyber_key_pair_generate`, `signal_kyber_public_key_serialize`, `signal_kyber_secret_key_serialize` |
+| X3DH + PQXDH + Double Ratchet | `signal_pre_key_bundle_new`, `signal_process_prekey_bundle`, `signal_encrypt_message`, `signal_decrypt_pre_key_message`, `signal_decrypt_message` |
+| Sender Keys | `signal_sender_key_distribution_message_create`, `signal_process_sender_key_distribution_message`, `signal_group_encrypt_message`, `signal_group_decrypt_message` |
+| Fingerprints | `signal_fingerprint_new`, `signal_fingerprint_scannable_encoding`, `signal_fingerprint_compare` |
+| Username ZK proof | `signal_username_hash`, `signal_username_proof`, `signal_username_verify` |
+| Account entropy pool | `signal_account_entropy_pool_generate`, `signal_account_entropy_pool_derive_svr_key`, `signal_account_entropy_pool_derive_backup_key`, `signal_backup_key_derive_media_encryption_key` |
 
 ## Notes
 
-**Store callbacks.** The five store structs (`libsignal_session_store_t`,
-`libsignal_identity_store_t`, `libsignal_pre_key_store_t`,
-`libsignal_signed_pre_key_store_t`, `libsignal_sender_key_store_t`) are passed
-**by value** to `libsignal_ctx_new`. Each holds a `void *ud` user-data pointer
-plus function pointer fields.
+**Error handling.** Every `signal_*` function returns `NULL` on success or a
+caller-owned `SignalFfiError*` on failure. Errors must be freed with
+`signal_error_free()`. The example wraps this in a `MUST()` macro that calls
+`signal_error_get_message()` and aborts on any failure.
 
-**malloc contract.** The `load` callbacks for session and sender key stores must
-write a `malloc`'d buffer to `*out`. The library calls `free()` on it after use.
-This example demonstrates the pattern:
+**Store callbacks.** The six store structs (`SignalSessionStore`,
+`SignalIdentityKeyStore`, `SignalPreKeyStore`, `SignalSignedPreKeyStore`,
+`SignalKyberPreKeyStore`, `SignalSenderKeyStore`) are passed by pointer to
+session functions. Each holds a `void *ud` user-data pointer plus function
+pointer fields. Callbacks return `SignalFfiError*` (NULL = success).
 
-```c
-static int sess_load(void *ud, const char *name, uint32_t dev,
-                     uint8_t **out, size_t *out_len) {
-    /* ... find entry ... */
-    *out     = (uint8_t *)malloc(entry->len);
-    *out_len = entry->len;
-    memcpy(*out, entry->data, entry->len);
-    return LIBSIGNAL_OK;
-}
-```
+**Serialization.** Store callbacks use `signal_session_record_serialize` /
+`signal_session_record_deserialize` (and their per-type equivalents) to
+convert opaque handles to bytes for storage and back. Output bytes arrive
+in `SignalOwnedBuffer` structs and must be freed with `signal_free_buffer`.
 
-**In-memory stores.** Identity, pre-key, and signed pre-key stores are simple
-stack-allocated structs. Session and sender key stores are fixed-size arrays
-with linear search — sufficient for a test harness and easy to follow.
+**In-memory stores.** All stores use a simple fixed-array key-value map
+(`kv_t`) with linear search — sufficient for a test harness and easy to
+follow.

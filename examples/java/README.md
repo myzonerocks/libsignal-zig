@@ -1,9 +1,12 @@
 # Java example
 
 Exercises the full C API via [JNA](https://github.com/java-native-access/jna)
-(Java Native Access). Store structs are modelled as `Structure.ByValue`
-subclasses with `Callback` fields for each function pointer. In-memory stores
-use `HashMap<String, byte[]>`.
+(Java Native Access). `Signal{Mut,Const}Pointer<T>` wrappers are declared as
+bare `Pointer` (ABI-equivalent on 64-bit). `SignalBorrowedBuffer` and
+`SignalOwnedBuffer` are modelled as `Structure.ByValue` subclasses.
+Store structs are raw `Memory` pointer arrays filled with JNA callback function
+pointers obtained via `CallbackReference.getFunctionPointer()`. In-memory
+stores use `HashMap<String, byte[]>`.
 
 ## Prerequisites
 
@@ -23,25 +26,23 @@ On first run, `run.sh` downloads `jna-5.14.0.jar` into `lib/` and compiles
 ## What it tests
 
 Each section prints `PASS` on success or throws `RuntimeException` with the
-section name and error code on failure.
+section name and error message on failure.
 
 | Section | API exercised |
 |---------|--------------|
-| EC + XEdDSA | `ec_keypair_generate`, `ec_dh`, `xeddsa_sign`, `xeddsa_verify` |
-| ML-KEM-1024 | `kyber1024_keypair_generate`, `kyber1024_encaps`, `kyber1024_decaps` |
-| X3DH + Double Ratchet | `ctx_new`, `process_prekey_bundle`, `encrypt`, `decrypt_prekey`, `decrypt` |
-| Sender Keys | `group_create_session`, `group_process_session`, `group_encrypt`, `group_decrypt` |
-| Sealed Sender V1 | `server_cert_serialize`, `sender_cert_serialize`, `sealed_sender_encrypt`, `sealed_sender_decrypt` |
-| Sealed Sender V2 | `sealed_sender_encrypt_v2`, `sealed_sender_v2_dispatch`, `sealed_sender_decrypt_v2` |
-| Fingerprints | `fingerprint_compute`, `fingerprint_compare` |
-| Username ZK proof | `username_hash`, `username_proof`, `username_verify` |
-| Account entropy pool | `account_entropy_pool_generate`, `account_entropy_derive_svr_key`, `account_entropy_derive_backup_key`, `backup_key_derive_media_key` |
+| EC + XEdDSA | `signal_privatekey_generate`, `signal_privatekey_agree`, `signal_privatekey_sign`, `signal_publickey_verify` |
+| ML-KEM-1024 | `signal_kyber_key_pair_generate`, `signal_kyber_public_key_serialize`, `signal_kyber_secret_key_serialize` |
+| X3DH + PQXDH + Double Ratchet | `signal_pre_key_bundle_new`, `signal_process_prekey_bundle`, `signal_encrypt_message`, `signal_decrypt_pre_key_message`, `signal_decrypt_message` |
+| Sender Keys | `signal_sender_key_distribution_message_create`, `signal_process_sender_key_distribution_message`, `signal_group_encrypt_message`, `signal_group_decrypt_message` |
+| Fingerprints | `signal_fingerprint_new`, `signal_fingerprint_scannable_encoding`, `signal_fingerprint_compare` |
+| Username ZK proof | `signal_username_hash`, `signal_username_proof`, `signal_username_verify` |
+| Account entropy pool | `signal_account_entropy_pool_generate`, `signal_account_entropy_pool_derive_svr_key`, `signal_account_entropy_pool_derive_backup_key`, `signal_backup_key_derive_media_encryption_key` |
 
 ## Memory contract
 
-JNA `Memory` objects are managed by JNA's garbage collector and must not be
-freed by C. The session store and sender key store `load` callbacks therefore
-use `Native.malloc` to allocate output buffers, which the library frees with
-the system `free()` after use. All other output pointers returned by the
-library are read into Java `byte[]` and freed via `Native.free` before the
-calling function returns.
+`SignalOwnedBuffer.ByRef` values returned by the library are read into Java
+`byte[]` and freed with `signal_free_buffer` before the calling method returns.
+Opaque handles (returned as `Pointer` out-parameters) are destroyed with
+`signal_*_destroy`. Store callbacks call back into the library to
+serialize/deserialize opaque handles; JNA callbacks can call other library
+methods synchronously without restriction.

@@ -23,20 +23,19 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(static_lib);
 
-    // Shared library with C-compatible exports (include/libsignal.h).
-    // Outputs are malloc'd; callers free with the standard free().
-    const shared_lib = b.addLibrary(.{
-        .name = "signal",
+    // Signal FFI shared library — signal_ffi.h-compatible C API.
+    // All C/C++/Go/Ruby/Java/Rust examples link against this.
+    const ffi_lib = b.addLibrary(.{
+        .name = "signal_ffi",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/c_api.zig"),
+            .root_source_file = b.path("src/ffi_entry.zig"),
             .target = target,
             .optimize = optimize,
         }),
         .linkage = .dynamic,
     });
-    shared_lib.root_module.link_libc = true;
-    b.installArtifact(shared_lib);
-    b.installFile("include/libsignal.h", "include/libsignal.h");
+    ffi_lib.root_module.link_libc = true;
+    b.installArtifact(ffi_lib);
 
     // Integration tests.
     const test_mod = b.createModule(.{
