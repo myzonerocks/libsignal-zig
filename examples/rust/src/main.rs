@@ -1,732 +1,985 @@
 /*
- * Every C FFI function exported by libsignal-zig.
- * Each section exercises a real-world roundtrip: generate → use → verify.
- * Any failure panics; a clean run prints PASS for each section.
+ * Exercises every protocol operation exported by libsignal-zig via signal_ffi.h.
+ * Hand-written #[repr(C)] bindings — no bindgen. The only external crate is `libc`
+ * (unused now that all memory is managed through signal_free_buffer / signal_free_string).
  *
- * Run with: cargo run
+ * Run with:  cargo run
  */
 
 use std::collections::HashMap;
-use std::ffi::{CStr, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::ptr;
 
 // ── FFI bindings ──────────────────────────────────────────────────────────────
 
 mod ffi {
-    use std::ffi::{c_char, c_int, c_void};
+    use std::ffi::{c_char, c_void};
 
-    pub const OK: c_int = 0;
-    pub const ERR_NOT_FOUND: c_int = -6;
-    pub const KYBER_PK: usize = 1568;
-    pub const KYBER_SK: usize = 3168;
-    pub const KYBER_CT: usize = 1568;
-    pub const KYBER_SS: usize = 32;
+    /// Two-field buffer whose memory is owned by the caller; free with
+    /// signal_free_buffer(base, length).
+    #[repr(C)]
+    pub struct OwnedBuffer {
+        pub base:   *mut u8,
+        pub length: usize,
+    }
+    impl OwnedBuffer {
+        pub const ZERO: Self = Self { base: std::ptr::null_mut(), length: 0 };
+    }
+
+    /// Two-field buffer that borrows from the caller's memory; the library
+    /// does not retain a reference after the call returns.
+    #[repr(C)]
+    pub struct BorrowedBuffer {
+        pub base:   *const u8,
+        pub length: usize,
+    }
+
+    // ── Store structs ─────────────────────────────────────────────────────────
+    // Field order matches signal_ffi.h exactly. All pointer handle types are
+    // ABI-equivalent to *mut c_void on 64-bit platforms.
 
     #[repr(C)]
     pub struct SessionStore {
-        pub ud: *mut c_void,
-        pub load:  Option<unsafe extern "C" fn(*mut c_void, *const c_char, u32, *mut *mut u8, *mut usize) -> c_int>,
-        pub store: Option<unsafe extern "C" fn(*mut c_void, *const c_char, u32, *const u8, usize) -> c_int>,
+        pub ctx:           *mut c_void,
+        pub load_session:  Option<unsafe extern "C" fn(*mut *mut c_void, *const c_void, *mut c_void) -> *mut c_void>,
+        pub store_session: Option<unsafe extern "C" fn(*const c_void, *mut c_void, *mut c_void) -> *mut c_void>,
+        pub destroy:       Option<unsafe extern "C" fn(*mut c_void)>,
     }
 
     #[repr(C)]
-    pub struct IdentityStore {
-        pub ud: *mut c_void,
-        pub get_keypair:         Option<unsafe extern "C" fn(*mut c_void, *mut u8, *mut u8) -> c_int>,
-        pub get_registration_id: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> c_int>,
-        pub save_identity:       Option<unsafe extern "C" fn(*mut c_void, *const c_char, u32, *const u8) -> c_int>,
-        pub is_trusted:          Option<unsafe extern "C" fn(*mut c_void, *const c_char, u32, *const u8, c_int) -> c_int>,
+    pub struct IdentityKeyStore {
+        pub ctx:                      *mut c_void,
+        pub get_identity_key_pair:    Option<unsafe extern "C" fn(*mut *mut c_void, *mut *mut c_void, *mut c_void) -> *mut c_void>,
+        pub get_local_registration_id:Option<unsafe extern "C" fn(*mut u32, *mut c_void) -> *mut c_void>,
+        pub save_identity:            Option<unsafe extern "C" fn(*const c_void, *mut c_void, *mut c_void) -> *mut c_void>,
+        pub is_trusted_identity:      Option<unsafe extern "C" fn(*mut bool, *const c_void, *mut c_void, u32, *mut c_void) -> *mut c_void>,
+        pub get_identity:             Option<unsafe extern "C" fn(*mut *mut c_void, *const c_void, *mut c_void) -> *mut c_void>,
+        pub destroy:                  Option<unsafe extern "C" fn(*mut c_void)>,
     }
 
     #[repr(C)]
     pub struct PreKeyStore {
-        pub ud:     *mut c_void,
-        pub load:   Option<unsafe extern "C" fn(*mut c_void, u32, *mut u8, *mut u8) -> c_int>,
-        pub remove: Option<unsafe extern "C" fn(*mut c_void, u32) -> c_int>,
+        pub ctx:          *mut c_void,
+        pub load_pre_key: Option<unsafe extern "C" fn(*mut *mut c_void, u32, *mut c_void) -> *mut c_void>,
+        pub store_pre_key:Option<unsafe extern "C" fn(u32, *mut c_void, *mut c_void) -> *mut c_void>,
+        pub remove_pre_key:Option<unsafe extern "C" fn(u32, *mut c_void) -> *mut c_void>,
+        pub destroy:      Option<unsafe extern "C" fn(*mut c_void)>,
     }
 
     #[repr(C)]
     pub struct SignedPreKeyStore {
-        pub ud:   *mut c_void,
-        pub load: Option<unsafe extern "C" fn(*mut c_void, u32, *mut u8, *mut u8, *mut u8, *mut u64) -> c_int>,
+        pub ctx:               *mut c_void,
+        pub load_signed_pre_key: Option<unsafe extern "C" fn(*mut *mut c_void, u32, *mut c_void) -> *mut c_void>,
+        pub store_signed_pre_key:Option<unsafe extern "C" fn(u32, *mut c_void, *mut c_void) -> *mut c_void>,
+        pub destroy:           Option<unsafe extern "C" fn(*mut c_void)>,
     }
 
     #[repr(C)]
     pub struct KyberPreKeyStore {
-        pub ud:        *mut c_void,
-        pub load:      Option<unsafe extern "C" fn(*mut c_void, u32, *mut u8, *mut u8, *mut u8) -> c_int>,
-        pub mark_used: Option<unsafe extern "C" fn(*mut c_void, u32) -> c_int>,
+        pub ctx:                   *mut c_void,
+        pub load_kyber_pre_key:    Option<unsafe extern "C" fn(*mut *mut c_void, u32, *mut c_void) -> *mut c_void>,
+        pub store_kyber_pre_key:   Option<unsafe extern "C" fn(u32, *mut c_void, *mut c_void) -> *mut c_void>,
+        pub mark_kyber_pre_key_used:Option<unsafe extern "C" fn(u32, *mut c_void) -> *mut c_void>,
+        pub destroy:               Option<unsafe extern "C" fn(*mut c_void)>,
     }
 
-    // Note: store field precedes load — matches the C struct declaration order.
+    // store_sender_key precedes load_sender_key — matches the C struct declaration order.
     #[repr(C)]
     pub struct SenderKeyStore {
-        pub ud:    *mut c_void,
-        pub store: Option<unsafe extern "C" fn(*mut c_void, *const c_char, u32, *const u8, *const u8, usize) -> c_int>,
-        pub load:  Option<unsafe extern "C" fn(*mut c_void, *const c_char, u32, *const u8, *mut *mut u8, *mut usize) -> c_int>,
+        pub ctx:             *mut c_void,
+        pub store_sender_key:Option<unsafe extern "C" fn(*const c_void, *const u8, *mut c_void, *mut c_void) -> *mut c_void>,
+        pub load_sender_key: Option<unsafe extern "C" fn(*mut *mut c_void, *const c_void, *const u8, *mut c_void) -> *mut c_void>,
+        pub destroy:         Option<unsafe extern "C" fn(*mut c_void)>,
     }
 
-    #[repr(C)]
-    pub struct V2Recipient {
-        pub service_id_fixed: [u8; 17],
-        pub device_id:        u8,
-        pub identity_pub:     [u8; 33],
-    }
-
-    pub enum Ctx {}
+    // ── Extern declarations ───────────────────────────────────────────────────
 
     extern "C" {
-        pub fn libsignal_ec_keypair_generate(pub_out: *mut u8, priv_out: *mut u8) -> c_int;
-        pub fn libsignal_ec_dh(their_pub: *const u8, our_priv: *const u8, out: *mut u8) -> c_int;
-        pub fn libsignal_xeddsa_sign(priv_: *const u8, msg: *const u8, len: usize, sig: *mut u8) -> c_int;
-        pub fn libsignal_xeddsa_verify(pub_: *const u8, msg: *const u8, len: usize, sig: *const u8) -> c_int;
+        // Errors and memory
+        pub fn signal_error_free(e: *mut c_void);
+        pub fn signal_error_get_message(out: *mut *const c_char, e: *const c_void) -> *mut c_void;
+        pub fn signal_free_buffer(buf: *mut u8, len: usize);
+        pub fn signal_free_string(s: *mut c_char);
 
-        pub fn libsignal_kyber1024_keypair_generate(pk: *mut u8, sk: *mut u8) -> c_int;
-        pub fn libsignal_kyber1024_encaps(pk: *const u8, ct: *mut u8, ss: *mut u8) -> c_int;
-        pub fn libsignal_kyber1024_decaps(sk: *const u8, ct: *const u8, ss: *mut u8) -> c_int;
+        // EC keys
+        pub fn signal_privatekey_generate(out: *mut *mut c_void) -> *mut c_void;
+        pub fn signal_privatekey_destroy(p: *mut c_void) -> *mut c_void;
+        pub fn signal_privatekey_serialize(out: *mut OwnedBuffer, key: *const c_void) -> *mut c_void;
+        pub fn signal_privatekey_deserialize(out: *mut *mut c_void, data: BorrowedBuffer) -> *mut c_void;
+        pub fn signal_privatekey_agree(out: *mut OwnedBuffer, key: *const c_void, their_key: *const c_void) -> *mut c_void;
+        pub fn signal_privatekey_sign(out: *mut OwnedBuffer, key: *const c_void, message: BorrowedBuffer) -> *mut c_void;
+        pub fn signal_privatekey_get_public_key(out: *mut *mut c_void, key: *const c_void) -> *mut c_void;
+        pub fn signal_publickey_destroy(p: *mut c_void) -> *mut c_void;
+        pub fn signal_publickey_serialize(out: *mut OwnedBuffer, key: *const c_void) -> *mut c_void;
+        pub fn signal_publickey_deserialize(out: *mut *mut c_void, data: BorrowedBuffer) -> *mut c_void;
+        pub fn signal_publickey_verify(out: *mut bool, key: *const c_void, msg: BorrowedBuffer, sig: BorrowedBuffer) -> *mut c_void;
 
-        pub fn libsignal_ctx_new(
-            remote_name:      *const c_char,
-            remote_device_id: u32,
-            sess:             SessionStore,
-            id:               IdentityStore,
-            pk:               PreKeyStore,
-            spk:              SignedPreKeyStore,
-            kyber:            *const KyberPreKeyStore,
-        ) -> *mut Ctx;
-        pub fn libsignal_ctx_free(ctx: *mut Ctx);
-        pub fn libsignal_process_prekey_bundle(
-            ctx:     *mut Ctx,
-            reg_id:  u32,
-            pk_id:   u32,
-            pk_pub:  *const u8,
-            spk_id:  u32,
-            spk_pub: *const u8,
-            spk_sig: *const u8,
-            id_pub:  *const u8,
-            kyber_id:  u32,
-            kyber_pub: *const u8,
-            kyber_sig: *const u8,
-        ) -> c_int;
-        pub fn libsignal_encrypt(
-            ctx: *mut Ctx,
-            pt: *const u8, pt_len: usize,
-            ct: *mut *mut u8, ct_len: *mut usize,
-            msg_type: *mut c_int,
-        ) -> c_int;
-        pub fn libsignal_decrypt_prekey(
-            ctx: *mut Ctx,
-            ct: *const u8, ct_len: usize,
-            pt: *mut *mut u8, pt_len: *mut usize,
-        ) -> c_int;
-        pub fn libsignal_decrypt(
-            ctx: *mut Ctx,
-            ct: *const u8, ct_len: usize,
-            pt: *mut *mut u8, pt_len: *mut usize,
-        ) -> c_int;
+        // Kyber keys
+        pub fn signal_kyber_key_pair_generate(out: *mut *mut c_void) -> *mut c_void;
+        pub fn signal_kyber_key_pair_destroy(p: *mut c_void) -> *mut c_void;
+        pub fn signal_kyber_key_pair_get_public_key(out: *mut *mut c_void, pair: *const c_void) -> *mut c_void;
+        pub fn signal_kyber_key_pair_get_secret_key(out: *mut *mut c_void, pair: *const c_void) -> *mut c_void;
+        pub fn signal_kyber_public_key_destroy(p: *mut c_void) -> *mut c_void;
+        pub fn signal_kyber_public_key_serialize(out: *mut OwnedBuffer, key: *const c_void) -> *mut c_void;
+        pub fn signal_kyber_secret_key_destroy(p: *mut c_void) -> *mut c_void;
+        pub fn signal_kyber_secret_key_serialize(out: *mut OwnedBuffer, key: *const c_void) -> *mut c_void;
 
-        pub fn libsignal_group_create_session(
-            name: *const c_char, dev: u32, dist: *const u8,
-            sk: SenderKeyStore,
-            skdm: *mut *mut u8, skdm_len: *mut usize,
-        ) -> c_int;
-        pub fn libsignal_group_process_session(
-            name: *const c_char, dev: u32,
-            skdm: *const u8, skdm_len: usize,
-            sk: SenderKeyStore,
-        ) -> c_int;
-        pub fn libsignal_group_encrypt(
-            name: *const c_char, dev: u32, dist: *const u8,
-            pt: *const u8, pt_len: usize,
-            sk: SenderKeyStore,
-            ct: *mut *mut u8, ct_len: *mut usize,
-        ) -> c_int;
-        pub fn libsignal_group_decrypt(
-            name: *const c_char, dev: u32, dist: *const u8,
-            ct: *const u8, ct_len: usize,
-            sk: SenderKeyStore,
-            pt: *mut *mut u8, pt_len: *mut usize,
-        ) -> c_int;
+        // Kyber pre-key records
+        pub fn signal_kyber_pre_key_record_new(out: *mut *mut c_void, id: u32, ts: u64, pair: *const c_void, sig: BorrowedBuffer) -> *mut c_void;
+        pub fn signal_kyber_pre_key_record_destroy(p: *mut c_void) -> *mut c_void;
+        pub fn signal_kyber_pre_key_record_get_public_key(out: *mut *mut c_void, rec: *const c_void) -> *mut c_void;
+        pub fn signal_kyber_pre_key_record_get_signature(out: *mut OwnedBuffer, rec: *const c_void) -> *mut c_void;
+        pub fn signal_kyber_pre_key_record_serialize(out: *mut OwnedBuffer, rec: *const c_void) -> *mut c_void;
+        pub fn signal_kyber_pre_key_record_deserialize(out: *mut *mut c_void, data: BorrowedBuffer) -> *mut c_void;
 
-        pub fn libsignal_server_cert_serialize(
-            key_id: u32, key_pub: *const u8, trust_root_priv: *const u8,
-            out: *mut *mut u8, out_len: *mut usize,
-        ) -> c_int;
-        pub fn libsignal_sender_cert_serialize(
-            uuid: *const c_char, e164: *const c_char,
-            dev: u32, key_pub: *const u8, expiry: u64,
-            srv_cert: *const u8, srv_cert_len: usize, srv_priv: *const u8,
-            out: *mut *mut u8, out_len: *mut usize,
-        ) -> c_int;
-        pub fn libsignal_sealed_sender_encrypt(
-            recip_pub: *const u8,
-            cert: *const u8, cert_len: usize,
-            msg_type: u8, hint: u8, group_id: *const c_char,
-            pt: *const u8, pt_len: usize,
-            out: *mut *mut u8, out_len: *mut usize,
-        ) -> c_int;
-        pub fn libsignal_sealed_sender_decrypt(
-            data: *const u8, data_len: usize, our_priv: *const u8,
-            uuid_out: *mut *mut u8, uuid_len: *mut usize,
-            e164_out: *mut *mut u8, e164_len: *mut usize,
-            dev_out: *mut u32, ctype_out: *mut u8,
-            contents: *mut *mut u8, contents_len: *mut usize,
-        ) -> c_int;
+        // Pre-key records
+        pub fn signal_pre_key_record_new(out: *mut *mut c_void, id: u32, pub_key: *const c_void, priv_key: *const c_void) -> *mut c_void;
+        pub fn signal_pre_key_record_destroy(p: *mut c_void) -> *mut c_void;
+        pub fn signal_pre_key_record_get_public_key(out: *mut *mut c_void, rec: *const c_void) -> *mut c_void;
+        pub fn signal_pre_key_record_serialize(out: *mut OwnedBuffer, rec: *const c_void) -> *mut c_void;
+        pub fn signal_pre_key_record_deserialize(out: *mut *mut c_void, data: BorrowedBuffer) -> *mut c_void;
 
-        pub fn libsignal_sealed_sender_encrypt_v2(
-            msg: *const u8, msg_len: usize,
-            sender_priv: *const u8, sender_pub: *const u8,
-            recips: *const V2Recipient, recip_count: usize,
-            excl: *const u8, excl_count: usize,
-            out: *mut *mut u8, out_len: *mut usize,
-        ) -> c_int;
-        pub fn libsignal_sealed_sender_v2_dispatch(
-            sent: *const u8, sent_len: usize,
-            svc_id: *const u8, dev: u8,
-            out: *mut *mut u8, out_len: *mut usize,
-        ) -> c_int;
-        pub fn libsignal_sealed_sender_decrypt_v2(
-            recv: *const u8, recv_len: usize,
-            our_priv: *const u8, our_pub: *const u8, sender_pub: *const u8,
-            out: *mut *mut u8, out_len: *mut usize,
-        ) -> c_int;
+        // Signed pre-key records
+        pub fn signal_signed_pre_key_record_new(out: *mut *mut c_void, id: u32, ts: u64, pub_key: *const c_void, priv_key: *const c_void, sig: BorrowedBuffer) -> *mut c_void;
+        pub fn signal_signed_pre_key_record_destroy(p: *mut c_void) -> *mut c_void;
+        pub fn signal_signed_pre_key_record_get_public_key(out: *mut *mut c_void, rec: *const c_void) -> *mut c_void;
+        pub fn signal_signed_pre_key_record_get_signature(out: *mut OwnedBuffer, rec: *const c_void) -> *mut c_void;
+        pub fn signal_signed_pre_key_record_serialize(out: *mut OwnedBuffer, rec: *const c_void) -> *mut c_void;
+        pub fn signal_signed_pre_key_record_deserialize(out: *mut *mut c_void, data: BorrowedBuffer) -> *mut c_void;
 
-        pub fn libsignal_fingerprint_compute(
-            local_pub: *const u8, local_id: *const u8, local_id_len: usize,
-            remote_pub: *const u8, remote_id: *const u8, remote_id_len: usize,
-            disp: *mut u8,
-            scan: *mut *mut u8, scan_len: *mut usize,
-        ) -> c_int;
-        pub fn libsignal_fingerprint_compare(
-            a: *const u8, a_len: usize,
-            b: *const u8, b_len: usize,
-            match_out: *mut c_int,
-        ) -> c_int;
+        // Sender key records
+        pub fn signal_sender_key_record_serialize(out: *mut OwnedBuffer, rec: *const c_void) -> *mut c_void;
+        pub fn signal_sender_key_record_deserialize(out: *mut *mut c_void, data: BorrowedBuffer) -> *mut c_void;
 
-        pub fn libsignal_username_hash(name: *const c_char, out: *mut u8) -> c_int;
-        pub fn libsignal_username_proof(name: *const c_char, rand: *const u8, out: *mut u8) -> c_int;
-        pub fn libsignal_username_verify(hash: *const u8, proof: *const u8, valid: *mut c_int) -> c_int;
+        // Session records
+        pub fn signal_session_record_serialize(out: *mut OwnedBuffer, rec: *const c_void) -> *mut c_void;
+        pub fn signal_session_record_deserialize(out: *mut *mut c_void, data: BorrowedBuffer) -> *mut c_void;
 
-        pub fn libsignal_account_entropy_pool_generate(out: *mut u8);
-        pub fn libsignal_account_entropy_pool_parse(pool: *const u8) -> c_int;
-        pub fn libsignal_account_entropy_derive_svr_key(pool: *const u8, out: *mut u8) -> c_int;
-        pub fn libsignal_account_entropy_derive_backup_key(pool: *const u8, out: *mut u8) -> c_int;
-        pub fn libsignal_backup_key_derive_media_key(backup: *const u8, out: *mut u8);
+        // Protocol address
+        pub fn signal_address_new(out: *mut *mut c_void, name: *const c_char, device_id: u32) -> *mut c_void;
+        pub fn signal_address_destroy(p: *mut c_void) -> *mut c_void;
+        pub fn signal_address_get_name(out: *mut *const c_char, obj: *const c_void) -> *mut c_void;
+        pub fn signal_address_get_device_id(out: *mut u32, obj: *const c_void) -> *mut c_void;
+
+        // Pre-key bundle
+        pub fn signal_pre_key_bundle_new(
+            out: *mut *mut c_void,
+            reg_id: u32, device_id: u32,
+            opk_id: u32, has_opk: bool, opk_pub: *const c_void,
+            spk_id: u32, spk_pub: *const c_void, spk_sig: BorrowedBuffer,
+            id_pub: *const c_void,
+            kpk_id: u32, has_kpk: bool, kpk_pub: *const c_void, kpk_sig: BorrowedBuffer,
+        ) -> *mut c_void;
+        pub fn signal_pre_key_bundle_destroy(p: *mut c_void) -> *mut c_void;
+
+        // Session protocol
+        pub fn signal_process_prekey_bundle(
+            bundle: *const c_void, addr: *const c_void,
+            sess: *const SessionStore, id: *const IdentityKeyStore,
+            pk: *const PreKeyStore, spk: *const SignedPreKeyStore,
+            kpk: *const KyberPreKeyStore,
+        ) -> *mut c_void;
+        pub fn signal_encrypt_message(
+            out: *mut *mut c_void, plaintext: BorrowedBuffer, addr: *const c_void,
+            sess: *const SessionStore, id: *const IdentityKeyStore,
+            pk: *const PreKeyStore, spk: *const SignedPreKeyStore,
+        ) -> *mut c_void;
+        pub fn signal_decrypt_message(
+            out: *mut OwnedBuffer, msg: *const c_void, addr: *const c_void,
+            sess: *const SessionStore, id: *const IdentityKeyStore,
+        ) -> *mut c_void;
+        pub fn signal_decrypt_pre_key_message(
+            out: *mut OwnedBuffer, msg: *const c_void, addr: *const c_void,
+            sess: *const SessionStore, id: *const IdentityKeyStore,
+            pk: *const PreKeyStore, spk: *const SignedPreKeyStore,
+            kpk: *const KyberPreKeyStore,
+        ) -> *mut c_void;
+
+        // Ciphertext message
+        pub fn signal_ciphertext_message_destroy(p: *mut c_void) -> *mut c_void;
+        pub fn signal_ciphertext_message_serialize(out: *mut OwnedBuffer, obj: *const c_void) -> *mut c_void;
+        pub fn signal_ciphertext_message_type(out: *mut u8, obj: *const c_void) -> *mut c_void;
+
+        // Pre-key signal message
+        pub fn signal_pre_key_signal_message_destroy(p: *mut c_void) -> *mut c_void;
+        pub fn signal_pre_key_signal_message_deserialize(out: *mut *mut c_void, data: BorrowedBuffer) -> *mut c_void;
+
+        // Signal message (whisper)
+        pub fn signal_message_destroy(p: *mut c_void) -> *mut c_void;
+        pub fn signal_message_deserialize(out: *mut *mut c_void, data: BorrowedBuffer) -> *mut c_void;
+
+        // Group / sender key
+        pub fn signal_sender_key_distribution_message_create(
+            out: *mut *mut c_void, sender: *const c_void,
+            dist_id: BorrowedBuffer, store: *const SenderKeyStore,
+        ) -> *mut c_void;
+        pub fn signal_process_sender_key_distribution_message(
+            sender: *const c_void, msg: *const c_void, store: *const SenderKeyStore,
+        ) -> *mut c_void;
+        pub fn signal_sender_key_distribution_message_destroy(p: *mut c_void) -> *mut c_void;
+        pub fn signal_group_encrypt_message(
+            out: *mut OwnedBuffer, sender: *const c_void,
+            dist_id: BorrowedBuffer, plaintext: BorrowedBuffer, store: *const SenderKeyStore,
+        ) -> *mut c_void;
+        pub fn signal_group_decrypt_message(
+            out: *mut OwnedBuffer, sender: *const c_void,
+            dist_id: BorrowedBuffer, ciphertext: BorrowedBuffer, store: *const SenderKeyStore,
+        ) -> *mut c_void;
+
+        // Fingerprints
+        pub fn signal_fingerprint_new(
+            out: *mut *mut c_void, iterations: u32, version: u32,
+            local_id: BorrowedBuffer, local_key: *const c_void,
+            remote_id: BorrowedBuffer, remote_key: *const c_void,
+        ) -> *mut c_void;
+        pub fn signal_fingerprint_destroy(p: *mut c_void) -> *mut c_void;
+        pub fn signal_fingerprint_scannable_encoding(out: *mut OwnedBuffer, obj: *const c_void) -> *mut c_void;
+        pub fn signal_fingerprint_compare(out: *mut bool, obj: *const c_void, theirs: BorrowedBuffer) -> *mut c_void;
+
+        // Username ZK proof
+        pub fn signal_username_hash(out: *mut u8, username: *const c_char) -> *mut c_void;
+        pub fn signal_username_proof(out: *mut OwnedBuffer, username: *const c_char) -> *mut c_void;
+        pub fn signal_username_verify(out: *mut bool, hash: *const u8, proof: BorrowedBuffer) -> *mut c_void;
+
+        // Account entropy pool
+        pub fn signal_account_entropy_pool_generate(out: *mut *mut c_void) -> *mut c_void;
+        pub fn signal_account_entropy_pool_destroy(p: *mut c_void) -> *mut c_void;
+        pub fn signal_account_entropy_pool_as_string(out: *mut *const c_char, obj: *const c_void) -> *mut c_void;
+        pub fn signal_account_entropy_pool_derive_svr_key(out: *mut u8, obj: *const c_void) -> *mut c_void;
+        pub fn signal_account_entropy_pool_derive_backup_key(out: *mut u8, obj: *const c_void) -> *mut c_void;
+
+        // Backup key
+        pub fn signal_backup_key_from_bytes(out: *mut *mut c_void, bytes: BorrowedBuffer) -> *mut c_void;
+        pub fn signal_backup_key_destroy(p: *mut c_void) -> *mut c_void;
+        pub fn signal_backup_key_derive_media_encryption_key(out: *mut u8, obj: *const c_void) -> *mut c_void;
     }
+}
+
+use ffi::{BorrowedBuffer, OwnedBuffer};
+
+// ── Helper: error checking ────────────────────────────────────────────────────
+
+fn die(e: *mut c_void, label: &str) -> ! {
+    unsafe {
+        let mut msg: *const c_char = ptr::null();
+        ffi::signal_error_get_message(&mut msg, e as *const c_void);
+        let s = if msg.is_null() { "(no message)".to_owned() }
+                else { CStr::from_ptr(msg).to_string_lossy().into_owned() };
+        ffi::signal_error_free(e);
+        panic!("[FAIL] {}: {}", label, s);
+    }
+}
+
+macro_rules! must {
+    ($call:expr) => {{
+        let e = $call;
+        if !e.is_null() { die(e, stringify!($call)); }
+    }};
+    ($call:expr, $label:expr) => {{
+        let e = $call;
+        if !e.is_null() { die(e, $label); }
+    }};
+}
+
+fn borrow(data: &[u8]) -> BorrowedBuffer {
+    BorrowedBuffer { base: data.as_ptr(), length: data.len() }
+}
+
+/// Read an OwnedBuffer into a Vec and free the buffer.
+unsafe fn read_owned(b: OwnedBuffer) -> Vec<u8> {
+    let v = std::slice::from_raw_parts(b.base, b.length).to_vec();
+    ffi::signal_free_buffer(b.base, b.length);
+    v
+}
+
+// ── Helper: address key ───────────────────────────────────────────────────────
+
+unsafe fn addr_key(addr: *const c_void) -> String {
+    let mut name: *const c_char = ptr::null();
+    let mut dev: u32 = 0;
+    must!(ffi::signal_address_get_name(&mut name, addr), "addr_get_name");
+    must!(ffi::signal_address_get_device_id(&mut dev, addr), "addr_get_dev");
+    format!("{}:{}", CStr::from_ptr(name).to_string_lossy(), dev)
+}
+
+/// Sender key store key: "name:dev:hexdist_id".
+unsafe fn sk_key(sender: *const c_void, dist_id: *const u8) -> String {
+    let base = addr_key(sender);
+    let dist = std::slice::from_raw_parts(dist_id, 16);
+    let hex: String = dist.iter().map(|b| format!("{:02x}", b)).collect();
+    format!("{}:{}", base, hex)
+}
+
+// ── Helper: sign bytes ────────────────────────────────────────────────────────
+
+/// Sign `data` with a 32-byte serialized private key; return signature bytes.
+unsafe fn sign_bytes(priv32: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut pk: *mut c_void = ptr::null_mut();
+    must!(ffi::signal_privatekey_deserialize(&mut pk, borrow(priv32)), "sign_bytes:deser");
+    let mut sig = OwnedBuffer::ZERO;
+    must!(ffi::signal_privatekey_sign(&mut sig, pk as *const c_void, borrow(data)), "sign_bytes:sign");
+    ffi::signal_privatekey_destroy(pk);
+    read_owned(sig)
 }
 
 // ── Store data types ──────────────────────────────────────────────────────────
 
-struct SessionDb(HashMap<(String, u32), Vec<u8>>);
-struct SenderKeyDb(HashMap<(String, u32, [u8; 16]), Vec<u8>>);
+struct KvDb(HashMap<String, Vec<u8>>);
 
-struct IdState {
-    pub_key:  [u8; 33],
-    priv_key: [u8; 32],
-    reg_id:   u32,
-}
-
-struct PkState {
-    id:       u32,
-    pub_key:  [u8; 33],
-    priv_key: [u8; 32],
-}
-
-struct SpkState {
-    id:       u32,
-    pub_key:  [u8; 33],
-    priv_key: [u8; 32],
-    sig:      [u8; 64],
+struct IdDb {
+    priv_bytes: Vec<u8>,
+    reg_id:     u32,
+    trusted:    KvDb,
 }
 
 // ── Session store callbacks ───────────────────────────────────────────────────
 
 unsafe extern "C" fn sess_load(
-    ud: *mut c_void, name: *const c_char, dev: u32,
-    out: *mut *mut u8, out_len: *mut usize,
-) -> c_int {
-    let db = &*(ud as *const SessionDb);
-    let key = (CStr::from_ptr(name).to_string_lossy().into_owned(), dev);
+    out: *mut *mut c_void, addr: *const c_void, ctx: *mut c_void,
+) -> *mut c_void {
+    let db = &*(ctx as *const KvDb);
+    let key = addr_key(addr);
     match db.0.get(&key) {
-        None => ffi::ERR_NOT_FOUND,
-        Some(data) => {
-            let buf = libc::malloc(data.len()) as *mut u8;
-            ptr::copy_nonoverlapping(data.as_ptr(), buf, data.len());
-            *out = buf;
-            *out_len = data.len();
-            ffi::OK
-        }
+        None => { *out = ptr::null_mut(); ptr::null_mut() }
+        Some(data) => ffi::signal_session_record_deserialize(out, borrow(data)),
     }
 }
 
 unsafe extern "C" fn sess_store(
-    ud: *mut c_void, name: *const c_char, dev: u32,
-    data: *const u8, len: usize,
-) -> c_int {
-    let db = &mut *(ud as *mut SessionDb);
-    let key = (CStr::from_ptr(name).to_string_lossy().into_owned(), dev);
-    db.0.insert(key, std::slice::from_raw_parts(data, len).to_vec());
-    ffi::OK
+    addr: *const c_void, rec: *mut c_void, ctx: *mut c_void,
+) -> *mut c_void {
+    let db = &mut *(ctx as *mut KvDb);
+    let key = addr_key(addr);
+    let mut bytes = OwnedBuffer::ZERO;
+    let e = ffi::signal_session_record_serialize(&mut bytes, rec as *const c_void);
+    if !e.is_null() { return e; }
+    db.0.insert(key, read_owned(bytes));
+    ptr::null_mut()
 }
 
-fn make_sess_store(db: &mut SessionDb) -> ffi::SessionStore {
+fn make_sess_store(db: &mut KvDb) -> ffi::SessionStore {
     ffi::SessionStore {
-        ud:    db as *mut SessionDb as *mut c_void,
-        load:  Some(sess_load),
-        store: Some(sess_store),
+        ctx: db as *mut KvDb as *mut c_void,
+        load_session:  Some(sess_load),
+        store_session: Some(sess_store),
+        destroy: None,
     }
 }
 
 // ── Identity store callbacks ──────────────────────────────────────────────────
 
-unsafe extern "C" fn id_get_keypair(ud: *mut c_void, pub_out: *mut u8, priv_out: *mut u8) -> c_int {
-    let s = &*(ud as *const IdState);
-    ptr::copy_nonoverlapping(s.pub_key.as_ptr(), pub_out, 33);
-    ptr::copy_nonoverlapping(s.priv_key.as_ptr(), priv_out, 32);
-    ffi::OK
+unsafe extern "C" fn id_get_kp(
+    out_pub: *mut *mut c_void, out_priv: *mut *mut c_void, ctx: *mut c_void,
+) -> *mut c_void {
+    let s = &*(ctx as *const IdDb);
+    let e = ffi::signal_privatekey_deserialize(out_priv, borrow(&s.priv_bytes));
+    if !e.is_null() { return e; }
+    ffi::signal_privatekey_get_public_key(out_pub, *out_priv as *const c_void)
 }
-unsafe extern "C" fn id_get_reg(ud: *mut c_void, out: *mut u32) -> c_int {
-    *out = (*(ud as *const IdState)).reg_id;
-    ffi::OK
-}
-unsafe extern "C" fn id_save(
-    _ud: *mut c_void, _name: *const c_char, _dev: u32, _pub: *const u8,
-) -> c_int { ffi::OK }
-unsafe extern "C" fn id_trusted(
-    _ud: *mut c_void, _name: *const c_char, _dev: u32, _pub: *const u8, _dir: c_int,
-) -> c_int { 1 }
 
-fn make_id_store(s: &mut IdState) -> ffi::IdentityStore {
-    ffi::IdentityStore {
-        ud:                  s as *mut IdState as *mut c_void,
-        get_keypair:         Some(id_get_keypair),
-        get_registration_id: Some(id_get_reg),
-        save_identity:       Some(id_save),
-        is_trusted:          Some(id_trusted),
+unsafe extern "C" fn id_get_reg(out: *mut u32, ctx: *mut c_void) -> *mut c_void {
+    *out = (*(ctx as *const IdDb)).reg_id;
+    ptr::null_mut()
+}
+
+unsafe extern "C" fn id_save(
+    addr: *const c_void, key: *mut c_void, ctx: *mut c_void,
+) -> *mut c_void {
+    let s = &mut *(ctx as *mut IdDb);
+    let k = addr_key(addr);
+    let mut bytes = OwnedBuffer::ZERO;
+    let e = ffi::signal_publickey_serialize(&mut bytes, key as *const c_void);
+    if !e.is_null() { return e; }
+    s.trusted.0.insert(k, read_owned(bytes));
+    ptr::null_mut()
+}
+
+unsafe extern "C" fn id_trusted(
+    out: *mut bool, _addr: *const c_void, _key: *mut c_void, _dir: u32, _ctx: *mut c_void,
+) -> *mut c_void {
+    *out = true;
+    ptr::null_mut()
+}
+
+unsafe extern "C" fn id_get(
+    out: *mut *mut c_void, addr: *const c_void, ctx: *mut c_void,
+) -> *mut c_void {
+    let s = &*(ctx as *const IdDb);
+    let k = addr_key(addr);
+    match s.trusted.0.get(&k) {
+        None => { *out = ptr::null_mut(); ptr::null_mut() }
+        Some(data) => ffi::signal_publickey_deserialize(out, borrow(data)),
+    }
+}
+
+fn make_id_store(db: &mut IdDb) -> ffi::IdentityKeyStore {
+    ffi::IdentityKeyStore {
+        ctx: db as *mut IdDb as *mut c_void,
+        get_identity_key_pair:     Some(id_get_kp),
+        get_local_registration_id: Some(id_get_reg),
+        save_identity:             Some(id_save),
+        is_trusted_identity:       Some(id_trusted),
+        get_identity:              Some(id_get),
+        destroy: None,
     }
 }
 
 // ── Pre-key store callbacks ───────────────────────────────────────────────────
 
-unsafe extern "C" fn pk_load(ud: *mut c_void, id: u32, pub_out: *mut u8, priv_out: *mut u8) -> c_int {
-    let s = &*(ud as *const PkState);
-    if id != s.id { return ffi::ERR_NOT_FOUND; }
-    ptr::copy_nonoverlapping(s.pub_key.as_ptr(), pub_out, 33);
-    ptr::copy_nonoverlapping(s.priv_key.as_ptr(), priv_out, 32);
-    ffi::OK
+unsafe extern "C" fn pk_load(
+    out: *mut *mut c_void, id: u32, ctx: *mut c_void,
+) -> *mut c_void {
+    let db = &*(ctx as *const KvDb);
+    match db.0.get(&id.to_string()) {
+        None => { *out = ptr::null_mut(); ptr::null_mut() }
+        Some(data) => ffi::signal_pre_key_record_deserialize(out, borrow(data)),
+    }
 }
-unsafe extern "C" fn pk_remove(_ud: *mut c_void, _id: u32) -> c_int { ffi::OK }
 
-fn make_pk_store(s: &mut PkState) -> ffi::PreKeyStore {
+unsafe extern "C" fn pk_store(id: u32, rec: *mut c_void, ctx: *mut c_void) -> *mut c_void {
+    let db = &mut *(ctx as *mut KvDb);
+    let mut bytes = OwnedBuffer::ZERO;
+    let e = ffi::signal_pre_key_record_serialize(&mut bytes, rec as *const c_void);
+    if !e.is_null() { return e; }
+    db.0.insert(id.to_string(), read_owned(bytes));
+    ptr::null_mut()
+}
+
+unsafe extern "C" fn pk_remove(_id: u32, _ctx: *mut c_void) -> *mut c_void {
+    ptr::null_mut()
+}
+
+fn make_pk_store(db: &mut KvDb) -> ffi::PreKeyStore {
     ffi::PreKeyStore {
-        ud:     s as *mut PkState as *mut c_void,
-        load:   Some(pk_load),
-        remove: Some(pk_remove),
+        ctx: db as *mut KvDb as *mut c_void,
+        load_pre_key:  Some(pk_load),
+        store_pre_key: Some(pk_store),
+        remove_pre_key:Some(pk_remove),
+        destroy: None,
     }
 }
 
 // ── Signed pre-key store callbacks ───────────────────────────────────────────
 
 unsafe extern "C" fn spk_load(
-    ud: *mut c_void, id: u32,
-    pub_out: *mut u8, priv_out: *mut u8, sig_out: *mut u8, ts: *mut u64,
-) -> c_int {
-    let s = &*(ud as *const SpkState);
-    if id != s.id { return ffi::ERR_NOT_FOUND; }
-    ptr::copy_nonoverlapping(s.pub_key.as_ptr(), pub_out, 33);
-    ptr::copy_nonoverlapping(s.priv_key.as_ptr(), priv_out, 32);
-    ptr::copy_nonoverlapping(s.sig.as_ptr(), sig_out, 64);
-    *ts = 1700000000;
-    ffi::OK
+    out: *mut *mut c_void, id: u32, ctx: *mut c_void,
+) -> *mut c_void {
+    let db = &*(ctx as *const KvDb);
+    match db.0.get(&id.to_string()) {
+        None => { *out = ptr::null_mut(); ptr::null_mut() }
+        Some(data) => ffi::signal_signed_pre_key_record_deserialize(out, borrow(data)),
+    }
 }
 
-fn make_spk_store(s: &mut SpkState) -> ffi::SignedPreKeyStore {
+unsafe extern "C" fn spk_store(id: u32, rec: *mut c_void, ctx: *mut c_void) -> *mut c_void {
+    let db = &mut *(ctx as *mut KvDb);
+    let mut bytes = OwnedBuffer::ZERO;
+    let e = ffi::signal_signed_pre_key_record_serialize(&mut bytes, rec as *const c_void);
+    if !e.is_null() { return e; }
+    db.0.insert(id.to_string(), read_owned(bytes));
+    ptr::null_mut()
+}
+
+fn make_spk_store(db: &mut KvDb) -> ffi::SignedPreKeyStore {
     ffi::SignedPreKeyStore {
-        ud:   s as *mut SpkState as *mut c_void,
-        load: Some(spk_load),
+        ctx: db as *mut KvDb as *mut c_void,
+        load_signed_pre_key:  Some(spk_load),
+        store_signed_pre_key: Some(spk_store),
+        destroy: None,
+    }
+}
+
+// ── Kyber pre-key store callbacks ─────────────────────────────────────────────
+
+unsafe extern "C" fn kpk_load(
+    out: *mut *mut c_void, id: u32, ctx: *mut c_void,
+) -> *mut c_void {
+    let db = &*(ctx as *const KvDb);
+    match db.0.get(&id.to_string()) {
+        None => { *out = ptr::null_mut(); ptr::null_mut() }
+        Some(data) => ffi::signal_kyber_pre_key_record_deserialize(out, borrow(data)),
+    }
+}
+
+unsafe extern "C" fn kpk_store(id: u32, rec: *mut c_void, ctx: *mut c_void) -> *mut c_void {
+    let db = &mut *(ctx as *mut KvDb);
+    let mut bytes = OwnedBuffer::ZERO;
+    let e = ffi::signal_kyber_pre_key_record_serialize(&mut bytes, rec as *const c_void);
+    if !e.is_null() { return e; }
+    db.0.insert(id.to_string(), read_owned(bytes));
+    ptr::null_mut()
+}
+
+unsafe extern "C" fn kpk_mark_used(_id: u32, _ctx: *mut c_void) -> *mut c_void {
+    ptr::null_mut()
+}
+
+fn make_kpk_store(db: &mut KvDb) -> ffi::KyberPreKeyStore {
+    ffi::KyberPreKeyStore {
+        ctx: db as *mut KvDb as *mut c_void,
+        load_kyber_pre_key:    Some(kpk_load),
+        store_kyber_pre_key:   Some(kpk_store),
+        mark_kyber_pre_key_used: Some(kpk_mark_used),
+        destroy: None,
     }
 }
 
 // ── Sender key store callbacks ────────────────────────────────────────────────
 
-unsafe extern "C" fn sk_store_cb(
-    ud: *mut c_void, name: *const c_char, dev: u32,
-    dist: *const u8, data: *const u8, len: usize,
-) -> c_int {
-    let db = &mut *(ud as *mut SenderKeyDb);
-    let name = CStr::from_ptr(name).to_string_lossy().into_owned();
-    let mut dist_arr = [0u8; 16];
-    ptr::copy_nonoverlapping(dist, dist_arr.as_mut_ptr(), 16);
-    db.0.insert((name, dev, dist_arr), std::slice::from_raw_parts(data, len).to_vec());
-    ffi::OK
+unsafe extern "C" fn sk_store(
+    sender: *const c_void, dist_id: *const u8, rec: *mut c_void, ctx: *mut c_void,
+) -> *mut c_void {
+    let db = &mut *(ctx as *mut KvDb);
+    let key = sk_key(sender, dist_id);
+    let mut bytes = OwnedBuffer::ZERO;
+    let e = ffi::signal_sender_key_record_serialize(&mut bytes, rec as *const c_void);
+    if !e.is_null() { return e; }
+    db.0.insert(key, read_owned(bytes));
+    ptr::null_mut()
 }
 
-unsafe extern "C" fn sk_load_cb(
-    ud: *mut c_void, name: *const c_char, dev: u32,
-    dist: *const u8, out: *mut *mut u8, out_len: *mut usize,
-) -> c_int {
-    let db = &*(ud as *const SenderKeyDb);
-    let name = CStr::from_ptr(name).to_string_lossy().into_owned();
-    let mut dist_arr = [0u8; 16];
-    ptr::copy_nonoverlapping(dist, dist_arr.as_mut_ptr(), 16);
-    match db.0.get(&(name, dev, dist_arr)) {
-        None => ffi::ERR_NOT_FOUND,
-        Some(data) => {
-            let buf = libc::malloc(data.len()) as *mut u8;
-            ptr::copy_nonoverlapping(data.as_ptr(), buf, data.len());
-            *out = buf;
-            *out_len = data.len();
-            ffi::OK
-        }
+unsafe extern "C" fn sk_load(
+    out: *mut *mut c_void, sender: *const c_void, dist_id: *const u8, ctx: *mut c_void,
+) -> *mut c_void {
+    let db = &*(ctx as *const KvDb);
+    let key = sk_key(sender, dist_id);
+    match db.0.get(&key) {
+        None => { *out = ptr::null_mut(); ptr::null_mut() }
+        Some(data) => ffi::signal_sender_key_record_deserialize(out, borrow(data)),
     }
 }
 
-fn make_sk_store(db: &mut SenderKeyDb) -> ffi::SenderKeyStore {
+fn make_sk_store(db: &mut KvDb) -> ffi::SenderKeyStore {
     ffi::SenderKeyStore {
-        ud:    db as *mut SenderKeyDb as *mut c_void,
-        store: Some(sk_store_cb),
-        load:  Some(sk_load_cb),
+        ctx: db as *mut KvDb as *mut c_void,
+        store_sender_key: Some(sk_store),
+        load_sender_key:  Some(sk_load),
+        destroy: None,
     }
 }
 
-// ── Helper ────────────────────────────────────────────────────────────────────
+// ── Bob key setup ─────────────────────────────────────────────────────────────
 
-fn must(rc: c_int, label: &str) {
-    if rc != 0 {
-        panic!("[FAIL] {}: error {}", label, rc);
+struct BobKeys {
+    id_priv: Vec<u8>,
+    reg_id:  u32,
+    opk_id:  u32,
+    spk_id:  u32,
+    kpk_id:  u32,
+}
+
+unsafe fn setup_bob(pk_db: &mut KvDb, spk_db: &mut KvDb, kpk_db: &mut KvDb) -> BobKeys {
+    // Identity key
+    let mut id_priv: *mut c_void = ptr::null_mut();
+    must!(ffi::signal_privatekey_generate(&mut id_priv), "bob_id_gen");
+    let mut id_priv_bytes = OwnedBuffer::ZERO;
+    must!(ffi::signal_privatekey_serialize(&mut id_priv_bytes, id_priv as *const c_void));
+    let id_priv_vec = read_owned(id_priv_bytes);
+    ffi::signal_privatekey_destroy(id_priv);
+
+    // One-time pre-key
+    let opk_id = 1u32;
+    {
+        let mut opk_priv: *mut c_void = ptr::null_mut();
+        let mut opk_pub:  *mut c_void = ptr::null_mut();
+        must!(ffi::signal_privatekey_generate(&mut opk_priv));
+        must!(ffi::signal_privatekey_get_public_key(&mut opk_pub, opk_priv as *const c_void));
+        let mut rec: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_pre_key_record_new(&mut rec, opk_id, opk_pub as *const c_void, opk_priv as *const c_void));
+        ffi::signal_privatekey_destroy(opk_priv);
+        ffi::signal_publickey_destroy(opk_pub);
+        pk_store(opk_id, rec, pk_db as *mut KvDb as *mut c_void);
+        ffi::signal_pre_key_record_destroy(rec);
     }
+
+    // Signed pre-key
+    let spk_id = 1u32;
+    {
+        let mut spk_priv: *mut c_void = ptr::null_mut();
+        let mut spk_pub:  *mut c_void = ptr::null_mut();
+        must!(ffi::signal_privatekey_generate(&mut spk_priv));
+        must!(ffi::signal_privatekey_get_public_key(&mut spk_pub, spk_priv as *const c_void));
+        let mut pub_bytes = OwnedBuffer::ZERO;
+        must!(ffi::signal_publickey_serialize(&mut pub_bytes, spk_pub as *const c_void));
+        let sig = sign_bytes(&id_priv_vec, std::slice::from_raw_parts(pub_bytes.base, pub_bytes.length));
+        ffi::signal_free_buffer(pub_bytes.base, pub_bytes.length);
+        let mut rec: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_signed_pre_key_record_new(
+            &mut rec, spk_id, 1700000000,
+            spk_pub as *const c_void, spk_priv as *const c_void, borrow(&sig)));
+        ffi::signal_privatekey_destroy(spk_priv);
+        ffi::signal_publickey_destroy(spk_pub);
+        spk_store(spk_id, rec, spk_db as *mut KvDb as *mut c_void);
+        ffi::signal_signed_pre_key_record_destroy(rec);
+    }
+
+    // Kyber pre-key
+    let kpk_id = 1u32;
+    {
+        let mut kpk: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_kyber_key_pair_generate(&mut kpk));
+        let mut kpk_pub_h: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_kyber_key_pair_get_public_key(&mut kpk_pub_h, kpk as *const c_void));
+        let mut pub_bytes = OwnedBuffer::ZERO;
+        must!(ffi::signal_kyber_public_key_serialize(&mut pub_bytes, kpk_pub_h as *const c_void));
+        let sig = sign_bytes(&id_priv_vec, std::slice::from_raw_parts(pub_bytes.base, pub_bytes.length));
+        ffi::signal_free_buffer(pub_bytes.base, pub_bytes.length);
+        ffi::signal_kyber_public_key_destroy(kpk_pub_h);
+        let mut rec: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_kyber_pre_key_record_new(&mut rec, kpk_id, 1700000000, kpk as *const c_void, borrow(&sig)));
+        ffi::signal_kyber_key_pair_destroy(kpk);
+        kpk_store(kpk_id, rec, kpk_db as *mut KvDb as *mut c_void);
+        ffi::signal_kyber_pre_key_record_destroy(rec);
+    }
+
+    BobKeys { id_priv: id_priv_vec, reg_id: 2002, opk_id, spk_id, kpk_id }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-fn test_ec() {
+fn test_ec_keys() {
     unsafe {
-        let mut a_pub  = [0u8; 33]; let mut a_priv = [0u8; 32];
-        let mut b_pub  = [0u8; 33]; let mut b_priv = [0u8; 32];
-        must(ffi::libsignal_ec_keypair_generate(a_pub.as_mut_ptr(), a_priv.as_mut_ptr()), "ec_gen_a");
-        must(ffi::libsignal_ec_keypair_generate(b_pub.as_mut_ptr(), b_priv.as_mut_ptr()), "ec_gen_b");
+        let mut pa: *mut c_void = ptr::null_mut();
+        let mut pb: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_privatekey_generate(&mut pa));
+        must!(ffi::signal_privatekey_generate(&mut pb));
 
-        let mut shared_a = [0u8; 32]; let mut shared_b = [0u8; 32];
-        must(ffi::libsignal_ec_dh(b_pub.as_ptr(), a_priv.as_ptr(), shared_a.as_mut_ptr()), "dh_a");
-        must(ffi::libsignal_ec_dh(a_pub.as_ptr(), b_priv.as_ptr(), shared_b.as_mut_ptr()), "dh_b");
-        assert_eq!(shared_a, shared_b, "[FAIL] ec_dh: shared secrets differ");
+        let mut qa: *mut c_void = ptr::null_mut();
+        let mut qb: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_privatekey_get_public_key(&mut qa, pa as *const c_void));
+        must!(ffi::signal_privatekey_get_public_key(&mut qb, pb as *const c_void));
+
+        let mut dh_a = OwnedBuffer::ZERO;
+        let mut dh_b = OwnedBuffer::ZERO;
+        must!(ffi::signal_privatekey_agree(&mut dh_a, pa as *const c_void, qb as *const c_void));
+        must!(ffi::signal_privatekey_agree(&mut dh_b, pb as *const c_void, qa as *const c_void));
+        assert_eq!(
+            std::slice::from_raw_parts(dh_a.base, dh_a.length),
+            std::slice::from_raw_parts(dh_b.base, dh_b.length),
+            "[FAIL] DH secrets differ"
+        );
+        ffi::signal_free_buffer(dh_a.base, dh_a.length);
+        ffi::signal_free_buffer(dh_b.base, dh_b.length);
 
         let msg = b"hello signal";
-        let mut sig = [0u8; 64];
-        must(ffi::libsignal_xeddsa_sign(a_priv.as_ptr(), msg.as_ptr(), msg.len(), sig.as_mut_ptr()), "xeddsa_sign");
-        must(ffi::libsignal_xeddsa_verify(a_pub.as_ptr(), msg.as_ptr(), msg.len(), sig.as_ptr()), "xeddsa_verify");
+        let mut sig = OwnedBuffer::ZERO;
+        must!(ffi::signal_privatekey_sign(&mut sig, pa as *const c_void, borrow(msg)));
+        let mut ok = false;
+        must!(ffi::signal_publickey_verify(&mut ok, qa as *const c_void, borrow(msg),
+            BorrowedBuffer { base: sig.base, length: sig.length }));
+        assert!(ok, "[FAIL] XEdDSA verify failed");
+        ffi::signal_free_buffer(sig.base, sig.length);
+
+        ffi::signal_privatekey_destroy(pa); ffi::signal_privatekey_destroy(pb);
+        ffi::signal_publickey_destroy(qa);  ffi::signal_publickey_destroy(qb);
     }
     println!("EC + XEdDSA                   PASS");
 }
 
-fn test_kyber() {
+fn test_kyber_keys() {
     unsafe {
-        let mut pk = vec![0u8; ffi::KYBER_PK];
-        let mut sk = vec![0u8; ffi::KYBER_SK];
-        must(ffi::libsignal_kyber1024_keypair_generate(pk.as_mut_ptr(), sk.as_mut_ptr()), "kyber_gen");
+        let mut kp: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_kyber_key_pair_generate(&mut kp));
 
-        let mut ct = vec![0u8; ffi::KYBER_CT];
-        let mut ss_enc = [0u8; ffi::KYBER_SS];
-        must(ffi::libsignal_kyber1024_encaps(pk.as_ptr(), ct.as_mut_ptr(), ss_enc.as_mut_ptr()), "encaps");
+        let mut pub_h: *mut c_void = ptr::null_mut();
+        let mut sec_h: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_kyber_key_pair_get_public_key(&mut pub_h, kp as *const c_void));
+        must!(ffi::signal_kyber_key_pair_get_secret_key(&mut sec_h, kp as *const c_void));
 
-        let mut ss_dec = [0u8; ffi::KYBER_SS];
-        must(ffi::libsignal_kyber1024_decaps(sk.as_ptr(), ct.as_ptr(), ss_dec.as_mut_ptr()), "decaps");
-        assert_eq!(ss_enc, ss_dec, "[FAIL] kyber: shared secrets differ");
+        let mut pub_b = OwnedBuffer::ZERO;
+        let mut sec_b = OwnedBuffer::ZERO;
+        must!(ffi::signal_kyber_public_key_serialize(&mut pub_b, pub_h as *const c_void));
+        must!(ffi::signal_kyber_secret_key_serialize(&mut sec_b, sec_h as *const c_void));
+
+        assert_eq!(pub_b.length, 1568, "[FAIL] Kyber public key size");
+        assert_eq!(sec_b.length, 3168, "[FAIL] Kyber secret key size");
+
+        ffi::signal_free_buffer(pub_b.base, pub_b.length);
+        ffi::signal_free_buffer(sec_b.base, sec_b.length);
+        ffi::signal_kyber_key_pair_destroy(kp);
+        ffi::signal_kyber_public_key_destroy(pub_h);
+        ffi::signal_kyber_secret_key_destroy(sec_h);
     }
     println!("ML-KEM-1024 (Kyber)           PASS");
 }
 
 fn test_session() {
     unsafe {
-        let mut alice_id  = IdState { pub_key: [0u8; 33], priv_key: [0u8; 32], reg_id: 1001 };
-        let mut bob_id    = IdState { pub_key: [0u8; 33], priv_key: [0u8; 32], reg_id: 2002 };
-        must(ffi::libsignal_ec_keypair_generate(alice_id.pub_key.as_mut_ptr(), alice_id.priv_key.as_mut_ptr()), "alice_id");
-        must(ffi::libsignal_ec_keypair_generate(bob_id.pub_key.as_mut_ptr(), bob_id.priv_key.as_mut_ptr()), "bob_id");
+        // Alice's identity
+        let mut alice_id_priv: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_privatekey_generate(&mut alice_id_priv));
+        let mut alice_id_priv_bytes = OwnedBuffer::ZERO;
+        must!(ffi::signal_privatekey_serialize(&mut alice_id_priv_bytes, alice_id_priv as *const c_void));
+        let alice_priv_vec = read_owned(alice_id_priv_bytes);
+        ffi::signal_privatekey_destroy(alice_id_priv);
 
-        let mut alice_pk  = PkState  { id: 0, pub_key: [0u8; 33], priv_key: [0u8; 32] };
-        let mut alice_spk = SpkState { id: 0, pub_key: [0u8; 33], priv_key: [0u8; 32], sig: [0u8; 64] };
-        let mut bob_pk    = PkState  { id: 1, pub_key: [0u8; 33], priv_key: [0u8; 32] };
-        let mut bob_spk   = SpkState { id: 1, pub_key: [0u8; 33], priv_key: [0u8; 32], sig: [0u8; 64] };
-        must(ffi::libsignal_ec_keypair_generate(bob_pk.pub_key.as_mut_ptr(), bob_pk.priv_key.as_mut_ptr()), "bob_opk");
-        must(ffi::libsignal_ec_keypair_generate(bob_spk.pub_key.as_mut_ptr(), bob_spk.priv_key.as_mut_ptr()), "bob_spk_gen");
-        must(ffi::libsignal_xeddsa_sign(bob_id.priv_key.as_ptr(), bob_spk.pub_key.as_ptr(), 33, bob_spk.sig.as_mut_ptr()), "spk_sig");
+        // Bob's stores and key material
+        let mut bob_sess_db = KvDb(HashMap::new());
+        let mut bob_pk_db   = KvDb(HashMap::new());
+        let mut bob_spk_db  = KvDb(HashMap::new());
+        let mut bob_kpk_db  = KvDb(HashMap::new());
+        let bob = setup_bob(&mut bob_pk_db, &mut bob_spk_db, &mut bob_kpk_db);
 
-        let mut alice_db = SessionDb(HashMap::new());
-        let mut bob_db   = SessionDb(HashMap::new());
+        // Reconstruct Bob's public key components for the bundle
+        let mut opk_rec: *mut c_void = ptr::null_mut();
+        pk_load(&mut opk_rec, bob.opk_id, &mut bob_pk_db as *mut KvDb as *mut c_void);
+        let mut opk_pub: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_pre_key_record_get_public_key(&mut opk_pub, opk_rec as *const c_void));
+        ffi::signal_pre_key_record_destroy(opk_rec);
 
-        let alice_ctx = ffi::libsignal_ctx_new(
-            b"bob\0".as_ptr() as *const c_char, 1,
-            make_sess_store(&mut alice_db),
-            make_id_store(&mut alice_id),
-            make_pk_store(&mut alice_pk),
-            make_spk_store(&mut alice_spk),
-            ptr::null(),
-        );
-        assert!(!alice_ctx.is_null(), "[FAIL] alice ctx_new returned null");
+        let mut spk_rec: *mut c_void = ptr::null_mut();
+        spk_load(&mut spk_rec, bob.spk_id, &mut bob_spk_db as *mut KvDb as *mut c_void);
+        let mut spk_pub: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_signed_pre_key_record_get_public_key(&mut spk_pub, spk_rec as *const c_void));
+        let mut spk_sig = OwnedBuffer::ZERO;
+        must!(ffi::signal_signed_pre_key_record_get_signature(&mut spk_sig, spk_rec as *const c_void));
+        ffi::signal_signed_pre_key_record_destroy(spk_rec);
 
-        must(ffi::libsignal_process_prekey_bundle(
-            alice_ctx, bob_id.reg_id,
-            bob_pk.id, bob_pk.pub_key.as_ptr(),
-            bob_spk.id, bob_spk.pub_key.as_ptr(), bob_spk.sig.as_ptr(),
-            bob_id.pub_key.as_ptr(),
-            0, ptr::null(), ptr::null(),
-        ), "process_bundle");
+        let mut kpk_rec: *mut c_void = ptr::null_mut();
+        kpk_load(&mut kpk_rec, bob.kpk_id, &mut bob_kpk_db as *mut KvDb as *mut c_void);
+        let mut kpk_pub: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_kyber_pre_key_record_get_public_key(&mut kpk_pub, kpk_rec as *const c_void));
+        let mut kpk_sig = OwnedBuffer::ZERO;
+        must!(ffi::signal_kyber_pre_key_record_get_signature(&mut kpk_sig, kpk_rec as *const c_void));
+        ffi::signal_kyber_pre_key_record_destroy(kpk_rec);
 
-        let mut ct: *mut u8 = ptr::null_mut();
-        let mut ct_len = 0usize;
-        let mut msg_type = 0i32;
-        must(ffi::libsignal_encrypt(alice_ctx, b"hello bob".as_ptr(), 9, &mut ct, &mut ct_len, &mut msg_type), "encrypt_1");
+        let mut bob_id_priv_h: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_privatekey_deserialize(&mut bob_id_priv_h, borrow(&bob.id_priv)));
+        let mut bob_id_pub: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_privatekey_get_public_key(&mut bob_id_pub, bob_id_priv_h as *const c_void));
+        ffi::signal_privatekey_destroy(bob_id_priv_h);
 
-        let bob_ctx = ffi::libsignal_ctx_new(
-            b"alice\0".as_ptr() as *const c_char, 1,
-            make_sess_store(&mut bob_db),
-            make_id_store(&mut bob_id),
-            make_pk_store(&mut bob_pk),
-            make_spk_store(&mut bob_spk),
-            ptr::null(),
-        );
-        assert!(!bob_ctx.is_null(), "[FAIL] bob ctx_new returned null");
+        let mut bundle: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_pre_key_bundle_new(
+            &mut bundle,
+            bob.reg_id, 1,
+            bob.opk_id, true,  opk_pub as *const c_void,
+            bob.spk_id,        spk_pub as *const c_void,
+            BorrowedBuffer { base: spk_sig.base, length: spk_sig.length },
+            bob_id_pub as *const c_void,
+            bob.kpk_id, true,  kpk_pub as *const c_void,
+            BorrowedBuffer { base: kpk_sig.base, length: kpk_sig.length },
+        ));
+        ffi::signal_publickey_destroy(opk_pub); ffi::signal_publickey_destroy(spk_pub);
+        ffi::signal_free_buffer(spk_sig.base, spk_sig.length);
+        ffi::signal_kyber_public_key_destroy(kpk_pub);
+        ffi::signal_free_buffer(kpk_sig.base, kpk_sig.length);
+        ffi::signal_publickey_destroy(bob_id_pub);
 
-        let mut pt: *mut u8 = ptr::null_mut();
-        let mut pt_len = 0usize;
-        must(ffi::libsignal_decrypt_prekey(bob_ctx, ct, ct_len, &mut pt, &mut pt_len), "decrypt_prekey");
-        assert_eq!(std::slice::from_raw_parts(pt, pt_len), b"hello bob");
-        libc::free(ct as *mut libc::c_void);
-        libc::free(pt as *mut libc::c_void);
+        // Alice's stores
+        let mut alice_sess_db = KvDb(HashMap::new());
+        let mut alice_pk_db   = KvDb(HashMap::new());
+        let mut alice_spk_db  = KvDb(HashMap::new());
+        let mut alice_kpk_db  = KvDb(HashMap::new());
+        let mut alice_id_db   = IdDb { priv_bytes: alice_priv_vec, reg_id: 1001, trusted: KvDb(HashMap::new()) };
+        let mut bob_id_db     = IdDb { priv_bytes: bob.id_priv.clone(), reg_id: bob.reg_id, trusted: KvDb(HashMap::new()) };
 
-        // Bob replies — session established, whisper message
-        let mut ct2: *mut u8 = ptr::null_mut(); let mut ct2_len = 0usize; let mut mt2 = 0i32;
-        must(ffi::libsignal_encrypt(bob_ctx, b"hey alice".as_ptr(), 9, &mut ct2, &mut ct2_len, &mut mt2), "encrypt_2");
-        let mut pt2: *mut u8 = ptr::null_mut(); let mut pt2_len = 0usize;
-        must(ffi::libsignal_decrypt(alice_ctx, ct2, ct2_len, &mut pt2, &mut pt2_len), "decrypt_whisper");
-        assert_eq!(std::slice::from_raw_parts(pt2, pt2_len), b"hey alice");
-        libc::free(ct2 as *mut libc::c_void);
-        libc::free(pt2 as *mut libc::c_void);
+        let mut bob_addr: *mut c_void = ptr::null_mut();
+        let bob_name = CString::new("bob").unwrap();
+        must!(ffi::signal_address_new(&mut bob_addr, bob_name.as_ptr(), 1));
+        let mut alice_addr: *mut c_void = ptr::null_mut();
+        let alice_name = CString::new("alice").unwrap();
+        must!(ffi::signal_address_new(&mut alice_addr, alice_name.as_ptr(), 1));
 
-        ffi::libsignal_ctx_free(alice_ctx);
-        ffi::libsignal_ctx_free(bob_ctx);
+        let a_ss  = make_sess_store(&mut alice_sess_db);
+        let a_is  = make_id_store(&mut alice_id_db);
+        let a_pks = make_pk_store(&mut alice_pk_db);
+        let a_sks = make_spk_store(&mut alice_spk_db);
+        let a_kks = make_kpk_store(&mut alice_kpk_db);
+
+        must!(ffi::signal_process_prekey_bundle(
+            bundle as *const c_void, bob_addr as *const c_void,
+            &a_ss, &a_is, &a_pks, &a_sks, &a_kks,
+        ));
+        ffi::signal_pre_key_bundle_destroy(bundle);
+
+        // Alice encrypts — first message is PreKeySignalMessage (type 3)
+        let pt1 = b"hello bob";
+        let mut ct1: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_encrypt_message(
+            &mut ct1, borrow(pt1), bob_addr as *const c_void,
+            &a_ss, &a_is, &a_pks, &a_sks,
+        ));
+        let mut ct1_type: u8 = 0;
+        must!(ffi::signal_ciphertext_message_type(&mut ct1_type, ct1 as *const c_void));
+        let mut ct1_bytes = OwnedBuffer::ZERO;
+        must!(ffi::signal_ciphertext_message_serialize(&mut ct1_bytes, ct1 as *const c_void));
+        ffi::signal_ciphertext_message_destroy(ct1);
+        assert_eq!(ct1_type, 3, "[FAIL] expected PreKey msg type 3, got {}", ct1_type);
+
+        // Bob decrypts the pre-key message
+        let b_ss  = make_sess_store(&mut bob_sess_db);
+        let b_is  = make_id_store(&mut bob_id_db);
+        let b_pks = make_pk_store(&mut bob_pk_db);
+        let b_sks = make_spk_store(&mut bob_spk_db);
+        let b_kks = make_kpk_store(&mut bob_kpk_db);
+
+        let mut pkmsg: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_pre_key_signal_message_deserialize(
+            &mut pkmsg, BorrowedBuffer { base: ct1_bytes.base, length: ct1_bytes.length }));
+        ffi::signal_free_buffer(ct1_bytes.base, ct1_bytes.length);
+
+        let mut dec1 = OwnedBuffer::ZERO;
+        must!(ffi::signal_decrypt_pre_key_message(
+            &mut dec1, pkmsg as *const c_void, alice_addr as *const c_void,
+            &b_ss, &b_is, &b_pks, &b_sks, &b_kks,
+        ));
+        ffi::signal_pre_key_signal_message_destroy(pkmsg);
+        assert_eq!(std::slice::from_raw_parts(dec1.base, dec1.length), pt1.as_ref(), "[FAIL] pre-key plaintext");
+        ffi::signal_free_buffer(dec1.base, dec1.length);
+
+        // Bob replies — now a regular whisper message (type 2)
+        let pt2 = b"hey alice";
+        let mut ct2: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_encrypt_message(
+            &mut ct2, borrow(pt2), alice_addr as *const c_void,
+            &b_ss, &b_is, &b_pks, &b_sks,
+        ));
+        let mut ct2_type: u8 = 0;
+        must!(ffi::signal_ciphertext_message_type(&mut ct2_type, ct2 as *const c_void));
+        let mut ct2_bytes = OwnedBuffer::ZERO;
+        must!(ffi::signal_ciphertext_message_serialize(&mut ct2_bytes, ct2 as *const c_void));
+        ffi::signal_ciphertext_message_destroy(ct2);
+        assert_eq!(ct2_type, 2, "[FAIL] expected whisper msg type 2, got {}", ct2_type);
+
+        let mut whisper: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_message_deserialize(
+            &mut whisper, BorrowedBuffer { base: ct2_bytes.base, length: ct2_bytes.length }));
+        ffi::signal_free_buffer(ct2_bytes.base, ct2_bytes.length);
+
+        let mut dec2 = OwnedBuffer::ZERO;
+        must!(ffi::signal_decrypt_message(
+            &mut dec2, whisper as *const c_void, bob_addr as *const c_void,
+            &a_ss, &a_is,
+        ));
+        ffi::signal_message_destroy(whisper);
+        assert_eq!(std::slice::from_raw_parts(dec2.base, dec2.length), pt2.as_ref(), "[FAIL] whisper plaintext");
+        ffi::signal_free_buffer(dec2.base, dec2.length);
+
+        ffi::signal_address_destroy(bob_addr);
+        ffi::signal_address_destroy(alice_addr);
     }
-    println!("X3DH + Double Ratchet         PASS");
+    println!("X3DH + PQXDH + Double Ratchet PASS");
 }
 
 fn test_group() {
+    let dist_id: [u8; 16] = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+    ];
     unsafe {
-        let dist_id: [u8; 16] = [
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-        ];
-        let mut alice_db = SenderKeyDb(HashMap::new());
-        let mut bob_db   = SenderKeyDb(HashMap::new());
+        let mut alice_sk_db = KvDb(HashMap::new());
+        let mut bob_sk_db   = KvDb(HashMap::new());
+        let a_store = make_sk_store(&mut alice_sk_db);
+        let b_store = make_sk_store(&mut bob_sk_db);
 
-        let mut skdm: *mut u8 = ptr::null_mut(); let mut skdm_len = 0usize;
-        must(ffi::libsignal_group_create_session(
-            b"alice\0".as_ptr() as *const c_char, 1,
-            dist_id.as_ptr(), make_sk_store(&mut alice_db),
-            &mut skdm, &mut skdm_len,
-        ), "group_create");
+        let mut alice_addr: *mut c_void = ptr::null_mut();
+        let alice_name = CString::new("alice").unwrap();
+        must!(ffi::signal_address_new(&mut alice_addr, alice_name.as_ptr(), 1));
+        let ca = alice_addr as *const c_void;
 
-        must(ffi::libsignal_group_process_session(
-            b"alice\0".as_ptr() as *const c_char, 1,
-            skdm, skdm_len, make_sk_store(&mut bob_db),
-        ), "group_process");
-        libc::free(skdm as *mut libc::c_void);
+        let mut skdm: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_sender_key_distribution_message_create(&mut skdm, ca,
+            BorrowedBuffer { base: dist_id.as_ptr(), length: dist_id.len() }, &a_store));
+        must!(ffi::signal_process_sender_key_distribution_message(ca, skdm as *const c_void, &b_store));
+        ffi::signal_sender_key_distribution_message_destroy(skdm);
 
-        let mut ct: *mut u8 = ptr::null_mut(); let mut ct_len = 0usize;
-        must(ffi::libsignal_group_encrypt(
-            b"alice\0".as_ptr() as *const c_char, 1,
-            dist_id.as_ptr(), b"group hello".as_ptr(), 11,
-            make_sk_store(&mut alice_db),
-            &mut ct, &mut ct_len,
-        ), "group_encrypt");
+        let msg = b"group hello";
+        let mut enc = OwnedBuffer::ZERO;
+        must!(ffi::signal_group_encrypt_message(&mut enc, ca,
+            BorrowedBuffer { base: dist_id.as_ptr(), length: dist_id.len() }, borrow(msg), &a_store));
 
-        let mut pt: *mut u8 = ptr::null_mut(); let mut pt_len = 0usize;
-        must(ffi::libsignal_group_decrypt(
-            b"alice\0".as_ptr() as *const c_char, 1,
-            dist_id.as_ptr(), ct, ct_len,
-            make_sk_store(&mut bob_db),
-            &mut pt, &mut pt_len,
-        ), "group_decrypt");
-        assert_eq!(std::slice::from_raw_parts(pt, pt_len), b"group hello");
-        libc::free(ct as *mut libc::c_void);
-        libc::free(pt as *mut libc::c_void);
+        let mut dec = OwnedBuffer::ZERO;
+        must!(ffi::signal_group_decrypt_message(
+            &mut dec, ca,
+            BorrowedBuffer { base: dist_id.as_ptr(), length: dist_id.len() },
+            BorrowedBuffer { base: enc.base, length: enc.length }, &b_store));
+        ffi::signal_free_buffer(enc.base, enc.length);
+
+        assert_eq!(std::slice::from_raw_parts(dec.base, dec.length), msg.as_ref(), "[FAIL] group plaintext");
+        ffi::signal_free_buffer(dec.base, dec.length);
+        ffi::signal_address_destroy(alice_addr);
     }
     println!("Sender Keys (group)           PASS");
 }
 
-fn test_sealed_sender_v1() {
-    unsafe {
-        let mut trust_pub  = [0u8; 33]; let mut trust_priv  = [0u8; 32];
-        let mut server_pub = [0u8; 33]; let mut server_priv = [0u8; 32];
-        let mut recv_pub   = [0u8; 33]; let mut recv_priv   = [0u8; 32];
-        let mut sender_pub = [0u8; 33]; let mut sender_priv = [0u8; 32];
-        must(ffi::libsignal_ec_keypair_generate(trust_pub.as_mut_ptr(),  trust_priv.as_mut_ptr()),  "trust_root");
-        must(ffi::libsignal_ec_keypair_generate(server_pub.as_mut_ptr(), server_priv.as_mut_ptr()), "server_kp");
-        must(ffi::libsignal_ec_keypair_generate(recv_pub.as_mut_ptr(),   recv_priv.as_mut_ptr()),   "recv_kp");
-        must(ffi::libsignal_ec_keypair_generate(sender_pub.as_mut_ptr(), sender_priv.as_mut_ptr()), "sender_kp");
-        let _ = sender_priv;
-
-        let mut srv_cert: *mut u8 = ptr::null_mut(); let mut srv_cert_len = 0usize;
-        must(ffi::libsignal_server_cert_serialize(
-            1, server_pub.as_ptr(), trust_priv.as_ptr(),
-            &mut srv_cert, &mut srv_cert_len,
-        ), "server_cert");
-
-        let mut snd_cert: *mut u8 = ptr::null_mut(); let mut snd_cert_len = 0usize;
-        must(ffi::libsignal_sender_cert_serialize(
-            b"alice-uuid\0".as_ptr() as *const c_char,
-            b"+15551234567\0".as_ptr() as *const c_char,
-            1, sender_pub.as_ptr(), 9_999_999_999u64,
-            srv_cert, srv_cert_len, server_priv.as_ptr(),
-            &mut snd_cert, &mut snd_cert_len,
-        ), "sender_cert");
-        libc::free(srv_cert as *mut libc::c_void);
-
-        let msg = b"sealed v1 message";
-        let mut envelope: *mut u8 = ptr::null_mut(); let mut env_len = 0usize;
-        must(ffi::libsignal_sealed_sender_encrypt(
-            recv_pub.as_ptr(), snd_cert, snd_cert_len,
-            1, 0, ptr::null(),
-            msg.as_ptr(), msg.len(),
-            &mut envelope, &mut env_len,
-        ), "ss_v1_encrypt");
-        libc::free(snd_cert as *mut libc::c_void);
-
-        let mut uuid_out: *mut u8 = ptr::null_mut(); let mut uuid_len = 0usize;
-        let mut e164_out: *mut u8 = ptr::null_mut(); let mut e164_len = 0usize;
-        let mut dev_id = 0u32; let mut ctype = 0u8;
-        let mut contents: *mut u8 = ptr::null_mut(); let mut cont_len = 0usize;
-        must(ffi::libsignal_sealed_sender_decrypt(
-            envelope, env_len, recv_priv.as_ptr(),
-            &mut uuid_out,  &mut uuid_len,
-            &mut e164_out,  &mut e164_len,
-            &mut dev_id, &mut ctype,
-            &mut contents, &mut cont_len,
-        ), "ss_v1_decrypt");
-        libc::free(envelope as *mut libc::c_void);
-
-        assert_eq!(std::slice::from_raw_parts(uuid_out, uuid_len), b"alice-uuid");
-        assert_eq!(std::slice::from_raw_parts(contents, cont_len), msg);
-        libc::free(uuid_out as *mut libc::c_void);
-        if !e164_out.is_null() { libc::free(e164_out as *mut libc::c_void); }
-        libc::free(contents as *mut libc::c_void);
-    }
-    println!("Sealed Sender V1              PASS");
-}
-
-fn test_sealed_sender_v2() {
-    unsafe {
-        let mut sender_pub = [0u8; 33]; let mut sender_priv = [0u8; 32];
-        let mut recv_pub   = [0u8; 33]; let mut recv_priv   = [0u8; 32];
-        must(ffi::libsignal_ec_keypair_generate(sender_pub.as_mut_ptr(), sender_priv.as_mut_ptr()), "ss2_sender");
-        must(ffi::libsignal_ec_keypair_generate(recv_pub.as_mut_ptr(),   recv_priv.as_mut_ptr()),   "ss2_recv");
-
-        let mut recip = ffi::V2Recipient {
-            service_id_fixed: [0u8; 17],
-            device_id:        1,
-            identity_pub:     recv_pub,
-        };
-        recip.service_id_fixed[0] = 0x00;
-        for i in 1..17usize { recip.service_id_fixed[i] = i as u8; }
-
-        let msg = b"sealed v2 message";
-        let mut sent: *mut u8 = ptr::null_mut(); let mut sent_len = 0usize;
-        must(ffi::libsignal_sealed_sender_encrypt_v2(
-            msg.as_ptr(), msg.len(),
-            sender_priv.as_ptr(), sender_pub.as_ptr(),
-            &recip, 1,
-            ptr::null(), 0,
-            &mut sent, &mut sent_len,
-        ), "ss2_encrypt");
-
-        let mut received: *mut u8 = ptr::null_mut(); let mut recv_len = 0usize;
-        must(ffi::libsignal_sealed_sender_v2_dispatch(
-            sent, sent_len,
-            recip.service_id_fixed.as_ptr(), recip.device_id,
-            &mut received, &mut recv_len,
-        ), "ss2_dispatch");
-        libc::free(sent as *mut libc::c_void);
-
-        let mut pt: *mut u8 = ptr::null_mut(); let mut pt_len = 0usize;
-        must(ffi::libsignal_sealed_sender_decrypt_v2(
-            received, recv_len,
-            recv_priv.as_ptr(), recv_pub.as_ptr(), sender_pub.as_ptr(),
-            &mut pt, &mut pt_len,
-        ), "ss2_decrypt");
-        libc::free(received as *mut libc::c_void);
-
-        assert_eq!(std::slice::from_raw_parts(pt, pt_len), msg);
-        libc::free(pt as *mut libc::c_void);
-    }
-    println!("Sealed Sender V2              PASS");
-}
-
 fn test_fingerprint() {
     unsafe {
-        let mut a_pub = [0u8; 33]; let mut a_priv = [0u8; 32];
-        let mut b_pub = [0u8; 33]; let mut b_priv = [0u8; 32];
-        must(ffi::libsignal_ec_keypair_generate(a_pub.as_mut_ptr(), a_priv.as_mut_ptr()), "fp_a");
-        must(ffi::libsignal_ec_keypair_generate(b_pub.as_mut_ptr(), b_priv.as_mut_ptr()), "fp_b");
-        let _ = (a_priv, b_priv);
+        let mut pa: *mut c_void = ptr::null_mut();
+        let mut pb: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_privatekey_generate(&mut pa));
+        must!(ffi::signal_privatekey_generate(&mut pb));
+        let mut qa: *mut c_void = ptr::null_mut();
+        let mut qb: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_privatekey_get_public_key(&mut qa, pa as *const c_void));
+        must!(ffi::signal_privatekey_get_public_key(&mut qb, pb as *const c_void));
+        ffi::signal_privatekey_destroy(pa); ffi::signal_privatekey_destroy(pb);
 
         let alice_id = b"+15551234567";
         let bob_id   = b"+15559876543";
-        let mut disp_a = [0u8; 60]; let mut scan_a: *mut u8 = ptr::null_mut(); let mut scan_a_len = 0usize;
-        let mut disp_b = [0u8; 60]; let mut scan_b: *mut u8 = ptr::null_mut(); let mut scan_b_len = 0usize;
 
-        must(ffi::libsignal_fingerprint_compute(
-            a_pub.as_ptr(), alice_id.as_ptr(), alice_id.len(),
-            b_pub.as_ptr(), bob_id.as_ptr(),   bob_id.len(),
-            disp_a.as_mut_ptr(), &mut scan_a, &mut scan_a_len,
-        ), "fp_compute_a");
-        must(ffi::libsignal_fingerprint_compute(
-            b_pub.as_ptr(), bob_id.as_ptr(),   bob_id.len(),
-            a_pub.as_ptr(), alice_id.as_ptr(), alice_id.len(),
-            disp_b.as_mut_ptr(), &mut scan_b, &mut scan_b_len,
-        ), "fp_compute_b");
-        let _ = (disp_a, disp_b);
+        let mut fp_a: *mut c_void = ptr::null_mut();
+        let mut fp_b: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_fingerprint_new(&mut fp_a, 5200, 0, borrow(alice_id), qa as *const c_void, borrow(bob_id), qb as *const c_void));
+        must!(ffi::signal_fingerprint_new(&mut fp_b, 5200, 0, borrow(bob_id), qb as *const c_void, borrow(alice_id), qa as *const c_void));
+        ffi::signal_publickey_destroy(qa); ffi::signal_publickey_destroy(qb);
 
-        let mut matched = 0i32;
-        must(ffi::libsignal_fingerprint_compare(
-            scan_a, scan_a_len, scan_b, scan_b_len, &mut matched,
-        ), "fp_compare");
-        assert_eq!(matched, 1, "[FAIL] fingerprint mismatch");
-        libc::free(scan_a as *mut libc::c_void);
-        libc::free(scan_b as *mut libc::c_void);
+        let mut scan_b = OwnedBuffer::ZERO;
+        must!(ffi::signal_fingerprint_scannable_encoding(&mut scan_b, fp_b as *const c_void));
+
+        let mut matched = false;
+        must!(ffi::signal_fingerprint_compare(
+            &mut matched, fp_a as *const c_void,
+            BorrowedBuffer { base: scan_b.base, length: scan_b.length }));
+        assert!(matched, "[FAIL] fingerprint mismatch");
+        ffi::signal_free_buffer(scan_b.base, scan_b.length);
+        ffi::signal_fingerprint_destroy(fp_a); ffi::signal_fingerprint_destroy(fp_b);
     }
     println!("Fingerprints                  PASS");
 }
 
 fn test_username() {
     unsafe {
+        let name = CString::new("alice.42").unwrap();
         let mut hash = [0u8; 32];
-        must(ffi::libsignal_username_hash(b"alice.42\0".as_ptr() as *const c_char, hash.as_mut_ptr()), "username_hash");
+        must!(ffi::signal_username_hash(hash.as_mut_ptr(), name.as_ptr()));
 
-        let randomness: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(3));
-        let mut proof = [0u8; 128];
-        must(ffi::libsignal_username_proof(b"alice.42\0".as_ptr() as *const c_char, randomness.as_ptr(), proof.as_mut_ptr()), "username_proof");
+        let mut proof = OwnedBuffer::ZERO;
+        must!(ffi::signal_username_proof(&mut proof, name.as_ptr()));
 
-        let mut valid = 0i32;
-        must(ffi::libsignal_username_verify(hash.as_ptr(), proof.as_ptr(), &mut valid), "username_verify");
-        assert_eq!(valid, 1, "[FAIL] username proof invalid");
+        let mut valid = false;
+        must!(ffi::signal_username_verify(&mut valid, hash.as_ptr(),
+            BorrowedBuffer { base: proof.base, length: proof.length }));
+        assert!(valid, "[FAIL] username proof invalid");
+        ffi::signal_free_buffer(proof.base, proof.length);
     }
     println!("Username ZK proof             PASS");
 }
 
 fn test_account_keys() {
     unsafe {
-        let mut pool = [0u8; 64];
-        ffi::libsignal_account_entropy_pool_generate(pool.as_mut_ptr());
-        must(ffi::libsignal_account_entropy_pool_parse(pool.as_ptr()), "pool_parse");
+        let mut pool: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_account_entropy_pool_generate(&mut pool));
+        let cp = pool as *const c_void;
 
-        let mut svr_key    = [0u8; 32];
-        let mut backup_key = [0u8; 32];
-        let mut media_key  = [0u8; 32];
-        must(ffi::libsignal_account_entropy_derive_svr_key(pool.as_ptr(), svr_key.as_mut_ptr()), "svr_key");
-        must(ffi::libsignal_account_entropy_derive_backup_key(pool.as_ptr(), backup_key.as_mut_ptr()), "backup_key");
-        ffi::libsignal_backup_key_derive_media_key(backup_key.as_ptr(), media_key.as_mut_ptr());
+        let mut s: *const c_char = ptr::null();
+        must!(ffi::signal_account_entropy_pool_as_string(&mut s, cp));
+        println!("  Entropy pool: {:.16}…", CStr::from_ptr(s).to_string_lossy());
+        ffi::signal_free_string(s as *mut c_char);
 
-        assert_ne!(svr_key, backup_key, "[FAIL] svr_key == backup_key");
-        assert_ne!(backup_key, media_key, "[FAIL] backup_key == media_key");
+        let mut svr    = [0u8; 32];
+        let mut bk_raw = [0u8; 32];
+        must!(ffi::signal_account_entropy_pool_derive_svr_key(svr.as_mut_ptr(), cp));
+        must!(ffi::signal_account_entropy_pool_derive_backup_key(bk_raw.as_mut_ptr(), cp));
+        ffi::signal_account_entropy_pool_destroy(pool);
+        assert_ne!(svr, bk_raw, "[FAIL] svr_key == backup_key");
+
+        let mut bk: *mut c_void = ptr::null_mut();
+        must!(ffi::signal_backup_key_from_bytes(&mut bk, borrow(&bk_raw)));
+        let mut media = [0u8; 32];
+        must!(ffi::signal_backup_key_derive_media_encryption_key(media.as_mut_ptr(), bk as *const c_void));
+        ffi::signal_backup_key_destroy(bk);
+        assert_ne!(bk_raw, media, "[FAIL] backup_key == media_key");
     }
     println!("Account entropy pool          PASS");
 }
@@ -734,13 +987,12 @@ fn test_account_keys() {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
-    test_ec();
-    test_kyber();
+    test_ec_keys();
+    test_kyber_keys();
     test_session();
     test_group();
-    test_sealed_sender_v1();
-    test_sealed_sender_v2();
     test_fingerprint();
     test_username();
     test_account_keys();
+    println!("\nAll signal_ffi tests PASSED.");
 }

@@ -1,8 +1,8 @@
 # C++ example
 
-Exercises the full C API via a direct `#include` of `libsignal.h`. No
+Exercises the full C API via a direct `#include` of `signal_ffi.h`. No
 generated bindings, no wrapper library — just C++ calling C. In-memory stores
-are implemented with `std::map`.
+are implemented with `std::map<std::string, std::vector<uint8_t>>`.
 
 ## Prerequisites
 
@@ -16,23 +16,21 @@ are implemented with `std::map`.
 make run
 ```
 
-`make` compiles `main.cpp` and links against `../../zig-out/lib/libsignal.dylib`
+`make` compiles `main.cpp` and links against `../../zig-out/lib/libsignal_ffi.dylib`
 (`.so` on Linux). The `rpath` is set at link time so the binary finds the
 library without any environment variables.
 
 ## What it tests
 
 Each function in the test suite prints `PASS` on success or aborts with the
-error code and section name on failure.
+error message and section name on failure.
 
 | Section | API exercised |
 |---------|--------------|
-| EC + XEdDSA | `ec_keypair_generate`, `ec_dh`, `xeddsa_sign`, `xeddsa_verify` |
-| ML-KEM-1024 | `kyber1024_keypair_generate`, `kyber1024_encaps`, `kyber1024_decaps` |
-| X3DH + Double Ratchet | `ctx_new`, `process_prekey_bundle`, `encrypt`, `decrypt_prekey`, `decrypt` |
-| Sender Keys | `group_create_session`, `group_process_session`, `group_encrypt`, `group_decrypt` |
-| Sealed Sender V1 | `server_cert_serialize`, `sender_cert_serialize`, `sealed_sender_encrypt`, `sealed_sender_decrypt` |
-| Sealed Sender V2 | `sealed_sender_encrypt_v2`, `sealed_sender_v2_dispatch`, `sealed_sender_decrypt_v2` |
-| Fingerprints | `fingerprint_compute`, `fingerprint_compare` |
-| Username ZK proof | `username_hash`, `username_proof`, `username_verify` |
-| Account entropy pool | `account_entropy_pool_generate`, `account_entropy_derive_svr_key`, `account_entropy_derive_backup_key`, `backup_key_derive_media_key` |
+| EC + XEdDSA | `signal_privatekey_generate`, `signal_privatekey_agree`, `signal_privatekey_sign`, `signal_publickey_verify` |
+| ML-KEM-1024 | `signal_kyber_key_pair_generate`, `signal_kyber_public_key_serialize`, `signal_kyber_secret_key_serialize` |
+| X3DH + PQXDH + Double Ratchet | `signal_pre_key_bundle_new`, `signal_process_prekey_bundle`, `signal_encrypt_message`, `signal_decrypt_pre_key_message`, `signal_decrypt_message` |
+| Sender Keys | `signal_sender_key_distribution_message_create`, `signal_process_sender_key_distribution_message`, `signal_group_encrypt_message`, `signal_group_decrypt_message` |
+| Fingerprints | `signal_fingerprint_new`, `signal_fingerprint_scannable_encoding`, `signal_fingerprint_compare` |
+| Username ZK proof | `signal_username_hash`, `signal_username_proof`, `signal_username_verify` |
+| Account entropy pool | `signal_account_entropy_pool_generate`, `signal_account_entropy_pool_derive_svr_key`, `signal_account_entropy_pool_derive_backup_key`, `signal_backup_key_derive_media_encryption_key` |

@@ -1,755 +1,704 @@
-// Every C FFI function exported by libsignal-zig.
-// Each section exercises a real-world roundtrip: generate → use → verify.
-// Any failure calls log.Fatalf; a clean run prints PASS for each section.
+// examples/go/main.go — signal_ffi.h round-trip exerciser (Go + cgo)
+//
+// The C store infrastructure (kv_t, all callbacks, test functions) lives in the
+// cgo block so the C compiler handles the signal_ffi.h opaque types directly.
+// Go's main() calls each C test function and prints results.
+//
+// Build and run:  go run main.go
 package main
 
 /*
-#cgo CFLAGS:  -I${SRCDIR}/../../include
-#cgo LDFLAGS: -L${SRCDIR}/../../zig-out/lib -lsignal -Wl,-rpath,${SRCDIR}/../../zig-out/lib
+#cgo CFLAGS:  -I${SRCDIR}/../../include -std=c11
+#cgo LDFLAGS: -L${SRCDIR}/../../zig-out/lib -lsignal_ffi -Wl,-rpath,${SRCDIR}/../../zig-out/lib
 
-#include "libsignal.h"
+#include "signal_ffi.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdbool.h>
 
-// ── Per-context identity state passed via ud ────────────────────────────────
+// ── Error helper ─────────────────────────────────────────────────────────────
+
+static void die(SignalFfiError *e, const char *label) {
+    const char *msg = NULL;
+    signal_error_get_message(&msg, e);
+    fprintf(stderr, "[FAIL] %s: %s\n", label, msg ? msg : "(no message)");
+    signal_error_free(e);
+    abort();
+}
+#define MUST(call) do { SignalFfiError *_e = (call); if (_e) die(_e, #call); } while(0)
+
+// ── Generic key-value store ───────────────────────────────────────────────────
+
+#define KV_MAX 128
+typedef struct { char key[512]; uint8_t *data; size_t len; } kv_row_t;
+typedef struct { kv_row_t rows[KV_MAX]; int n; } kv_t;
+
+static void kv_put(kv_t *s, const char *k, const uint8_t *d, size_t l) {
+    for (int i = 0; i < s->n; i++) {
+        if (strcmp(s->rows[i].key, k) == 0) {
+            free(s->rows[i].data);
+            s->rows[i].data = malloc(l); memcpy(s->rows[i].data, d, l);
+            s->rows[i].len  = l; return;
+        }
+    }
+    if (s->n >= KV_MAX) { fputs("[FAIL] kv_put: store full\n", stderr); abort(); }
+    strncpy(s->rows[s->n].key, k, 511);
+    s->rows[s->n].data = malloc(l); memcpy(s->rows[s->n].data, d, l);
+    s->rows[s->n].len  = l; s->n++;
+}
+static int kv_get(kv_t *s, const char *k, uint8_t **d, size_t *l) {
+    for (int i = 0; i < s->n; i++) {
+        if (strcmp(s->rows[i].key, k) == 0) {
+            *l = s->rows[i].len; *d = malloc(*l);
+            memcpy(*d, s->rows[i].data, *l); return 1;
+        }
+    }
+    return 0;
+}
+static void kv_free(kv_t *s) {
+    for (int i = 0; i < s->n; i++) free(s->rows[i].data);
+    memset(s, 0, sizeof *s);
+}
+
+static void addr_to_key(char *buf, size_t sz, const SignalProtocolAddress *addr) {
+    const char *name = NULL; uint32_t dev = 0;
+    SignalConstPointerSignalProtocolAddress ca = {addr};
+    MUST(signal_address_get_name(&name, ca));
+    MUST(signal_address_get_device_id(&dev, ca));
+    snprintf(buf, sz, "%s:%u", name, dev);
+}
+
+// ── Session store ─────────────────────────────────────────────────────────────
+
+static SignalFfiError *sess_load(SignalMutPointerSignalSessionRecord *out,
+                                  const SignalProtocolAddress *addr, void *ud) {
+    char k[512]; addr_to_key(k, sizeof k, addr);
+    uint8_t *data; size_t len;
+    if (!kv_get((kv_t *)ud, k, &data, &len)) { out->raw = NULL; return NULL; }
+    SignalBorrowedBuffer buf = {data, len};
+    SignalFfiError *e = signal_session_record_deserialize(out, buf);
+    free(data); return e;
+}
+static SignalFfiError *sess_store_fn(const SignalProtocolAddress *addr,
+                                      SignalConstPointerSignalSessionRecord rec,
+                                      void *ud) {
+    char k[512]; addr_to_key(k, sizeof k, addr);
+    SignalOwnedBuffer b = {0};
+    SignalFfiError *e = signal_session_record_serialize(&b, rec);
+    if (e) return e;
+    kv_put((kv_t *)ud, k, b.base, b.length);
+    signal_free_buffer(b.base, b.length); return NULL;
+}
+static SignalSessionStore make_sess(kv_t *kv) {
+    return (SignalSessionStore){kv, sess_load, sess_store_fn, NULL};
+}
+
+// ── Identity store ────────────────────────────────────────────────────────────
 
 typedef struct {
-    uint8_t  id_pub[33];
-    uint8_t  id_priv[32];
+    uint8_t  priv_bytes[32];
     uint32_t reg_id;
+    kv_t     trusted;
 } id_state_t;
 
-static int id_get_keypair(void *ud, uint8_t pub[33], uint8_t priv[32]) {
-    id_state_t *s = (id_state_t*)ud;
-    memcpy(pub,  s->id_pub,  33);
-    memcpy(priv, s->id_priv, 32);
-    return 0;
+static SignalFfiError *id_get_kp(SignalMutPointerSignalPublicKey *out_pub,
+                                  SignalMutPointerSignalPrivateKey *out_priv,
+                                  void *ud) {
+    id_state_t *s = ud;
+    SignalBorrowedBuffer pb = {s->priv_bytes, 32};
+    SignalFfiError *e = signal_privatekey_deserialize(out_priv, pb);
+    if (e) return e;
+    return signal_privatekey_get_public_key(out_pub,
+               (SignalConstPointerSignalPrivateKey){out_priv->raw});
 }
-static int id_get_reg_id(void *ud, uint32_t *out) {
-    *out = ((id_state_t*)ud)->reg_id;
-    return 0;
+static SignalFfiError *id_get_reg(uint32_t *out, void *ud) {
+    *out = ((id_state_t *)ud)->reg_id; return NULL;
 }
-static int id_save(void *ud, const char *name, uint32_t dev, const uint8_t pub[33]) {
-    (void)ud; (void)name; (void)dev; (void)pub;
-    return 0;
+static SignalFfiError *id_save(const SignalProtocolAddress *addr,
+                                SignalConstPointerSignalPublicKey key, void *ud) {
+    id_state_t *s = ud;
+    char k[512]; addr_to_key(k, sizeof k, addr);
+    SignalOwnedBuffer b = {0};
+    SignalFfiError *e = signal_publickey_serialize(&b, key);
+    if (e) return e;
+    kv_put(&s->trusted, k, b.base, b.length);
+    signal_free_buffer(b.base, b.length); return NULL;
 }
-static int id_is_trusted(void *ud, const char *name, uint32_t dev,
-                          const uint8_t pub[33], int dir) {
-    (void)ud; (void)name; (void)dev; (void)pub; (void)dir;
-    return 1;
+static SignalFfiError *id_trusted(bool *out, const SignalProtocolAddress *addr,
+                                   SignalConstPointerSignalPublicKey key,
+                                   uint32_t dir, void *ud) {
+    (void)addr; (void)key; (void)dir; (void)ud; *out = true; return NULL;
+}
+static SignalFfiError *id_get(SignalMutPointerSignalPublicKey *out,
+                               const SignalProtocolAddress *addr, void *ud) {
+    id_state_t *s = ud;
+    char k[512]; addr_to_key(k, sizeof k, addr);
+    uint8_t *data; size_t len;
+    if (!kv_get(&s->trusted, k, &data, &len)) { out->raw = NULL; return NULL; }
+    SignalBorrowedBuffer buf = {data, len};
+    SignalFfiError *e = signal_publickey_deserialize(out, buf);
+    free(data); return e;
+}
+static SignalIdentityKeyStore make_id(id_state_t *s) {
+    return (SignalIdentityKeyStore){s, id_get_kp, id_get_reg, id_save, id_trusted, id_get, NULL};
 }
 
-static libsignal_identity_store_t make_id_store(id_state_t *s) {
-    libsignal_identity_store_t st;
-    st.ud                  = s;
-    st.get_keypair         = id_get_keypair;
-    st.get_registration_id = id_get_reg_id;
-    st.save_identity       = id_save;
-    st.is_trusted          = id_is_trusted;
-    return st;
+// ── Pre-key store ─────────────────────────────────────────────────────────────
+
+static SignalFfiError *pk_load(SignalMutPointerSignalPreKeyRecord *out,
+                                uint32_t id, void *ud) {
+    char k[32]; snprintf(k, sizeof k, "%u", id);
+    uint8_t *data; size_t len;
+    if (!kv_get((kv_t *)ud, k, &data, &len)) { out->raw = NULL; return NULL; }
+    SignalBorrowedBuffer buf = {data, len};
+    SignalFfiError *e = signal_pre_key_record_deserialize(out, buf);
+    free(data); return e;
+}
+static SignalFfiError *pk_store_fn(uint32_t id,
+                                    SignalMutPointerSignalPreKeyRecord rec,
+                                    void *ud) {
+    char k[32]; snprintf(k, sizeof k, "%u", id);
+    SignalOwnedBuffer b = {0};
+    SignalFfiError *e = signal_pre_key_record_serialize(&b,
+                            (SignalConstPointerSignalPreKeyRecord){rec.raw});
+    if (e) return e;
+    kv_put((kv_t *)ud, k, b.base, b.length);
+    signal_free_buffer(b.base, b.length); return NULL;
+}
+static SignalFfiError *pk_remove(uint32_t id, void *ud) {
+    (void)id; (void)ud; return NULL;
+}
+static SignalPreKeyStore make_pk(kv_t *kv) {
+    return (SignalPreKeyStore){kv, pk_load, pk_store_fn, pk_remove, NULL};
 }
 
-// ── In-process session store keyed by (name, device_id) ────────────────────
+// ── Signed pre-key store ──────────────────────────────────────────────────────
 
-#define MAX_SESSIONS 64
+static SignalFfiError *spk_load(SignalMutPointerSignalSignedPreKeyRecord *out,
+                                 uint32_t id, void *ud) {
+    char k[32]; snprintf(k, sizeof k, "%u", id);
+    uint8_t *data; size_t len;
+    if (!kv_get((kv_t *)ud, k, &data, &len)) { out->raw = NULL; return NULL; }
+    SignalBorrowedBuffer buf = {data, len};
+    SignalFfiError *e = signal_signed_pre_key_record_deserialize(out, buf);
+    free(data); return e;
+}
+static SignalFfiError *spk_store_fn(uint32_t id,
+                                     SignalMutPointerSignalSignedPreKeyRecord rec,
+                                     void *ud) {
+    char k[32]; snprintf(k, sizeof k, "%u", id);
+    SignalOwnedBuffer b = {0};
+    SignalFfiError *e = signal_signed_pre_key_record_serialize(&b,
+                            (SignalConstPointerSignalSignedPreKeyRecord){rec.raw});
+    if (e) return e;
+    kv_put((kv_t *)ud, k, b.base, b.length);
+    signal_free_buffer(b.base, b.length); return NULL;
+}
+static SignalSignedPreKeyStore make_spk(kv_t *kv) {
+    return (SignalSignedPreKeyStore){kv, spk_load, spk_store_fn, NULL};
+}
+
+// ── Kyber pre-key store ───────────────────────────────────────────────────────
+
+static SignalFfiError *kpk_load(SignalMutPointerSignalKyberPreKeyRecord *out,
+                                 uint32_t id, void *ud) {
+    char k[32]; snprintf(k, sizeof k, "%u", id);
+    uint8_t *data; size_t len;
+    if (!kv_get((kv_t *)ud, k, &data, &len)) { out->raw = NULL; return NULL; }
+    SignalBorrowedBuffer buf = {data, len};
+    SignalFfiError *e = signal_kyber_pre_key_record_deserialize(out, buf);
+    free(data); return e;
+}
+static SignalFfiError *kpk_store_fn(uint32_t id,
+                                     SignalMutPointerSignalKyberPreKeyRecord rec,
+                                     void *ud) {
+    char k[32]; snprintf(k, sizeof k, "%u", id);
+    SignalOwnedBuffer b = {0};
+    SignalFfiError *e = signal_kyber_pre_key_record_serialize(&b,
+                            (SignalConstPointerSignalKyberPreKeyRecord){rec.raw});
+    if (e) return e;
+    kv_put((kv_t *)ud, k, b.base, b.length);
+    signal_free_buffer(b.base, b.length); return NULL;
+}
+static SignalFfiError *kpk_mark_used(uint32_t id, void *ud) {
+    (void)id; (void)ud; return NULL;
+}
+static SignalKyberPreKeyStore make_kpk(kv_t *kv) {
+    return (SignalKyberPreKeyStore){kv, kpk_load, kpk_store_fn, kpk_mark_used, NULL};
+}
+
+// ── Sender key store ──────────────────────────────────────────────────────────
+
+static void sk_key(char *buf, size_t sz,
+                    const SignalProtocolAddress *sender, const uint8_t dist_id[16]) {
+    const char *name = NULL; uint32_t dev = 0;
+    SignalConstPointerSignalProtocolAddress ca = {sender};
+    MUST(signal_address_get_name(&name, ca));
+    MUST(signal_address_get_device_id(&dev, ca));
+    int n = snprintf(buf, sz, "%s:%u:", name, dev);
+    for (int i = 0; i < 16; i++) n += snprintf(buf + n, sz - n, "%02x", dist_id[i]);
+}
+static SignalFfiError *sk_store_fn(const SignalProtocolAddress *sender,
+                                    const uint8_t dist_id[16],
+                                    SignalConstPointerSignalSenderKeyRecord rec,
+                                    void *ud) {
+    char k[600]; sk_key(k, sizeof k, sender, dist_id);
+    SignalOwnedBuffer b = {0};
+    SignalFfiError *e = signal_sender_key_record_serialize(&b, rec);
+    if (e) return e;
+    kv_put((kv_t *)ud, k, b.base, b.length);
+    signal_free_buffer(b.base, b.length); return NULL;
+}
+static SignalFfiError *sk_load_fn(SignalMutPointerSignalSenderKeyRecord *out,
+                                   const SignalProtocolAddress *sender,
+                                   const uint8_t dist_id[16], void *ud) {
+    char k[600]; sk_key(k, sizeof k, sender, dist_id);
+    uint8_t *data; size_t len;
+    if (!kv_get((kv_t *)ud, k, &data, &len)) { out->raw = NULL; return NULL; }
+    SignalBorrowedBuffer buf = {data, len};
+    SignalFfiError *e = signal_sender_key_record_deserialize(out, buf);
+    free(data); return e;
+}
+static SignalSenderKeyStore make_sk(kv_t *kv) {
+    return (SignalSenderKeyStore){kv, sk_store_fn, sk_load_fn, NULL};
+}
+
+// ── sign_bytes helper ─────────────────────────────────────────────────────────
+
+static SignalOwnedBuffer sign_bytes(const uint8_t priv32[32],
+                                     const uint8_t *data, size_t len) {
+    SignalMutPointerSignalPrivateKey pk = {NULL};
+    MUST(signal_privatekey_deserialize(&pk, (SignalBorrowedBuffer){priv32, 32}));
+    SignalOwnedBuffer sig = {0};
+    MUST(signal_privatekey_sign(&sig, (SignalConstPointerSignalPrivateKey){pk.raw},
+                                 (SignalBorrowedBuffer){data, len}));
+    signal_privatekey_destroy(pk);
+    return sig;
+}
+
+// ── Bob setup (identity + OPK + SPK + KPK → stores) ─────────────────────────
+
 typedef struct {
-    char     name[128];
-    uint32_t device_id;
-    uint8_t *data;
-    size_t   len;
-} session_entry_t;
+    uint8_t  id_priv[32];
+    uint32_t reg_id;
+    uint32_t opk_id, spk_id, kpk_id;
+} bob_keys_t;
 
-typedef struct {
-    session_entry_t entries[MAX_SESSIONS];
-    int             count;
-} session_db_t;
+static void setup_bob(bob_keys_t *out,
+                       kv_t *pk_store, kv_t *spk_store, kv_t *kpk_store) {
+    SignalMutPointerSignalPrivateKey id_priv = {NULL};
+    MUST(signal_privatekey_generate(&id_priv));
+    SignalOwnedBuffer id_bytes = {0};
+    MUST(signal_privatekey_serialize(&id_bytes,
+                                      (SignalConstPointerSignalPrivateKey){id_priv.raw}));
+    memcpy(out->id_priv, id_bytes.base, 32);
+    signal_free_buffer(id_bytes.base, id_bytes.length);
+    out->reg_id = 2002;
 
-static int sess_load(void *ud, const char *name, uint32_t dev,
-                     uint8_t **out, size_t *out_len) {
-    session_db_t *db = (session_db_t*)ud;
-    for (int i = 0; i < db->count; i++) {
-        if (strcmp(db->entries[i].name, name) == 0 && db->entries[i].device_id == dev) {
-            *out     = (uint8_t*)malloc(db->entries[i].len);
-            *out_len = db->entries[i].len;
-            memcpy(*out, db->entries[i].data, db->entries[i].len);
-            return 0;
-        }
+    out->opk_id = 1;
+    SignalMutPointerSignalPrivateKey opk_priv = {NULL};
+    MUST(signal_privatekey_generate(&opk_priv));
+    SignalMutPointerSignalPublicKey opk_pub = {NULL};
+    MUST(signal_privatekey_get_public_key(&opk_pub,
+             (SignalConstPointerSignalPrivateKey){opk_priv.raw}));
+    SignalMutPointerSignalPreKeyRecord opk_rec = {NULL};
+    MUST(signal_pre_key_record_new(&opk_rec, out->opk_id,
+             (SignalConstPointerSignalPublicKey){opk_pub.raw},
+             (SignalConstPointerSignalPrivateKey){opk_priv.raw}));
+    signal_privatekey_destroy(opk_priv); signal_publickey_destroy(opk_pub);
+    MUST(pk_store_fn(out->opk_id, opk_rec, pk_store));
+    signal_pre_key_record_destroy(opk_rec);
+
+    out->spk_id = 1;
+    SignalMutPointerSignalPrivateKey spk_priv = {NULL};
+    MUST(signal_privatekey_generate(&spk_priv));
+    SignalMutPointerSignalPublicKey spk_pub = {NULL};
+    MUST(signal_privatekey_get_public_key(&spk_pub,
+             (SignalConstPointerSignalPrivateKey){spk_priv.raw}));
+    SignalOwnedBuffer spk_pub_b = {0};
+    MUST(signal_publickey_serialize(&spk_pub_b,
+             (SignalConstPointerSignalPublicKey){spk_pub.raw}));
+    SignalOwnedBuffer spk_sig = sign_bytes(out->id_priv,
+                                            spk_pub_b.base, spk_pub_b.length);
+    signal_free_buffer(spk_pub_b.base, spk_pub_b.length);
+    SignalMutPointerSignalSignedPreKeyRecord spk_rec = {NULL};
+    MUST(signal_signed_pre_key_record_new(&spk_rec, out->spk_id, 1700000000,
+             (SignalConstPointerSignalPublicKey){spk_pub.raw},
+             (SignalConstPointerSignalPrivateKey){spk_priv.raw},
+             (SignalBorrowedBuffer){spk_sig.base, spk_sig.length}));
+    signal_free_buffer(spk_sig.base, spk_sig.length);
+    signal_privatekey_destroy(spk_priv); signal_publickey_destroy(spk_pub);
+    MUST(spk_store_fn(out->spk_id, spk_rec, spk_store));
+    signal_signed_pre_key_record_destroy(spk_rec);
+
+    out->kpk_id = 1;
+    SignalMutPointerSignalKyberKeyPair kpk = {NULL};
+    MUST(signal_kyber_key_pair_generate(&kpk));
+    SignalMutPointerSignalKyberPublicKey kpk_pub = {NULL};
+    MUST(signal_kyber_key_pair_get_public_key(&kpk_pub,
+             (SignalConstPointerSignalKyberKeyPair){kpk.raw}));
+    SignalOwnedBuffer kpk_pub_b = {0};
+    MUST(signal_kyber_public_key_serialize(&kpk_pub_b,
+             (SignalConstPointerSignalKyberPublicKey){kpk_pub.raw}));
+    SignalOwnedBuffer kpk_sig = sign_bytes(out->id_priv,
+                                            kpk_pub_b.base, kpk_pub_b.length);
+    signal_free_buffer(kpk_pub_b.base, kpk_pub_b.length);
+    signal_kyber_public_key_destroy(kpk_pub);
+    SignalMutPointerSignalKyberPreKeyRecord kpk_rec = {NULL};
+    MUST(signal_kyber_pre_key_record_new(&kpk_rec, out->kpk_id, 1700000000,
+             (SignalConstPointerSignalKyberKeyPair){kpk.raw},
+             (SignalBorrowedBuffer){kpk_sig.base, kpk_sig.length}));
+    signal_free_buffer(kpk_sig.base, kpk_sig.length);
+    signal_kyber_key_pair_destroy(kpk);
+    MUST(kpk_store_fn(out->kpk_id, kpk_rec, kpk_store));
+    signal_kyber_pre_key_record_destroy(kpk_rec);
+
+    signal_privatekey_destroy(id_priv);
+}
+
+// ── Test functions ────────────────────────────────────────────────────────────
+
+static void run_test_ec_keys(void) {
+    SignalMutPointerSignalPrivateKey pa = {NULL}, pb = {NULL};
+    MUST(signal_privatekey_generate(&pa));
+    MUST(signal_privatekey_generate(&pb));
+    SignalMutPointerSignalPublicKey qa = {NULL}, qb = {NULL};
+    MUST(signal_privatekey_get_public_key(&qa, (SignalConstPointerSignalPrivateKey){pa.raw}));
+    MUST(signal_privatekey_get_public_key(&qb, (SignalConstPointerSignalPrivateKey){pb.raw}));
+
+    SignalOwnedBuffer dh_a = {0}, dh_b = {0};
+    MUST(signal_privatekey_agree(&dh_a, (SignalConstPointerSignalPrivateKey){pa.raw},
+                                         (SignalConstPointerSignalPublicKey){qb.raw}));
+    MUST(signal_privatekey_agree(&dh_b, (SignalConstPointerSignalPrivateKey){pb.raw},
+                                         (SignalConstPointerSignalPublicKey){qa.raw}));
+    if (dh_a.length != 32 || memcmp(dh_a.base, dh_b.base, 32) != 0) {
+        fputs("[FAIL] DH secrets differ\n", stderr); abort();
     }
-    return -6;
+    signal_free_buffer(dh_a.base, dh_a.length);
+    signal_free_buffer(dh_b.base, dh_b.length);
+
+    const uint8_t msg[] = "hello signal";
+    SignalOwnedBuffer sig = {0};
+    MUST(signal_privatekey_sign(&sig, (SignalConstPointerSignalPrivateKey){pa.raw},
+                                 (SignalBorrowedBuffer){msg, sizeof msg - 1}));
+    bool ok = false;
+    MUST(signal_publickey_verify(&ok, (SignalConstPointerSignalPublicKey){qa.raw},
+                                  (SignalBorrowedBuffer){msg, sizeof msg - 1},
+                                  (SignalBorrowedBuffer){sig.base, sig.length}));
+    if (!ok) { fputs("[FAIL] XEdDSA verify failed\n", stderr); abort(); }
+    signal_free_buffer(sig.base, sig.length);
+    signal_privatekey_destroy(pa); signal_privatekey_destroy(pb);
+    signal_publickey_destroy(qa);  signal_publickey_destroy(qb);
+    printf("EC + XEdDSA                   PASS\n");
 }
-static int sess_store(void *ud, const char *name, uint32_t dev,
-                      const uint8_t *data, size_t len) {
-    session_db_t *db = (session_db_t*)ud;
-    for (int i = 0; i < db->count; i++) {
-        if (strcmp(db->entries[i].name, name) == 0 && db->entries[i].device_id == dev) {
-            free(db->entries[i].data);
-            db->entries[i].data = (uint8_t*)malloc(len);
-            db->entries[i].len  = len;
-            memcpy(db->entries[i].data, data, len);
-            return 0;
-        }
+
+static void run_test_kyber_keys(void) {
+    SignalMutPointerSignalKyberKeyPair kp = {NULL};
+    MUST(signal_kyber_key_pair_generate(&kp));
+    SignalMutPointerSignalKyberPublicKey pub = {NULL};
+    SignalMutPointerSignalKyberSecretKey sec = {NULL};
+    MUST(signal_kyber_key_pair_get_public_key(&pub, (SignalConstPointerSignalKyberKeyPair){kp.raw}));
+    MUST(signal_kyber_key_pair_get_secret_key(&sec, (SignalConstPointerSignalKyberKeyPair){kp.raw}));
+    SignalOwnedBuffer pub_b = {0}, sec_b = {0};
+    MUST(signal_kyber_public_key_serialize(&pub_b, (SignalConstPointerSignalKyberPublicKey){pub.raw}));
+    MUST(signal_kyber_secret_key_serialize(&sec_b, (SignalConstPointerSignalKyberSecretKey){sec.raw}));
+    if (pub_b.length != 1568 || sec_b.length != 3168) {
+        fprintf(stderr, "[FAIL] Kyber sizes: pub=%zu sec=%zu\n", pub_b.length, sec_b.length); abort();
     }
-    if (db->count >= MAX_SESSIONS) return -7;
-    strncpy(db->entries[db->count].name, name, 127);
-    db->entries[db->count].device_id = dev;
-    db->entries[db->count].data = (uint8_t*)malloc(len);
-    db->entries[db->count].len  = len;
-    memcpy(db->entries[db->count].data, data, len);
-    db->count++;
-    return 0;
+    signal_free_buffer(pub_b.base, pub_b.length);
+    signal_free_buffer(sec_b.base, sec_b.length);
+    signal_kyber_key_pair_destroy(kp);
+    signal_kyber_public_key_destroy(pub);
+    signal_kyber_secret_key_destroy(sec);
+    printf("ML-KEM-1024 (Kyber)           PASS\n");
 }
 
-static libsignal_session_store_t make_sess_store(session_db_t *db) {
-    libsignal_session_store_t s;
-    s.ud    = db;
-    s.load  = sess_load;
-    s.store = sess_store;
-    return s;
-}
-
-static session_db_t *new_session_db(void) {
-    session_db_t *db = (session_db_t*)calloc(1, sizeof(session_db_t));
-    return db;
-}
-
-static void free_session_db(session_db_t *db) {
-    for (int i = 0; i < db->count; i++) free(db->entries[i].data);
-    free(db);
-}
-
-// ── Per-context pre-key store (single key) ──────────────────────────────────
-
-typedef struct {
-    uint32_t id;
-    uint8_t  pub[33];
-    uint8_t  priv[32];
-} pk_state_t;
-
-static int pk_load(void *ud, uint32_t id, uint8_t pub[33], uint8_t priv[32]) {
-    pk_state_t *s = (pk_state_t*)ud;
-    if (id != s->id) return -6;
-    memcpy(pub,  s->pub,  33);
-    memcpy(priv, s->priv, 32);
-    return 0;
-}
-static int pk_remove(void *ud, uint32_t id) { (void)ud; (void)id; return 0; }
-
-static libsignal_pre_key_store_t make_pk_store(pk_state_t *s) {
-    libsignal_pre_key_store_t st;
-    st.ud     = s;
-    st.load   = pk_load;
-    st.remove = pk_remove;
-    return st;
-}
-
-// ── Per-context signed pre-key store ────────────────────────────────────────
-
-typedef struct {
-    uint32_t id;
-    uint8_t  pub[33];
-    uint8_t  priv[32];
-    uint8_t  sig[64];
-} spk_state_t;
-
-static int spk_load(void *ud, uint32_t id, uint8_t pub[33], uint8_t priv[32],
-                    uint8_t sig[64], uint64_t *ts) {
-    spk_state_t *s = (spk_state_t*)ud;
-    if (id != s->id) return -6;
-    memcpy(pub,  s->pub,  33);
-    memcpy(priv, s->priv, 32);
-    memcpy(sig,  s->sig,  64);
-    *ts = 1700000000;
-    return 0;
-}
-
-static libsignal_signed_pre_key_store_t make_spk_store(spk_state_t *s) {
-    libsignal_signed_pre_key_store_t st;
-    st.ud   = s;
-    st.load = spk_load;
-    return st;
-}
-
-// ── In-process sender-key store ─────────────────────────────────────────────
-
-#define MAX_SKDM 16
-typedef struct {
-    char     name[128];
-    uint32_t dev;
-    uint8_t  dist[16];
-    uint8_t *data;
-    size_t   len;
-} sk_entry_t;
-
-typedef struct {
-    sk_entry_t entries[MAX_SKDM];
-    int        count;
-} sk_db_t;
-
-static int sk_store_fn(void *ud, const char *name, uint32_t dev,
-                        const uint8_t dist[16], const uint8_t *data, size_t len) {
-    sk_db_t *db = (sk_db_t*)ud;
-    for (int i = 0; i < db->count; i++) {
-        if (strcmp(db->entries[i].name, name) == 0 && db->entries[i].dev == dev &&
-            memcmp(db->entries[i].dist, dist, 16) == 0) {
-            free(db->entries[i].data);
-            db->entries[i].data = (uint8_t*)malloc(len);
-            db->entries[i].len  = len;
-            memcpy(db->entries[i].data, data, len);
-            return 0;
-        }
+static void run_test_session(void) {
+    uint8_t alice_id_priv[32];
+    {
+        SignalMutPointerSignalPrivateKey p = {NULL};
+        MUST(signal_privatekey_generate(&p));
+        SignalOwnedBuffer b = {0};
+        MUST(signal_privatekey_serialize(&b, (SignalConstPointerSignalPrivateKey){p.raw}));
+        memcpy(alice_id_priv, b.base, 32);
+        signal_free_buffer(b.base, b.length);
+        signal_privatekey_destroy(p);
     }
-    if (db->count >= MAX_SKDM) return -7;
-    strncpy(db->entries[db->count].name, name, 127);
-    db->entries[db->count].dev = dev;
-    memcpy(db->entries[db->count].dist, dist, 16);
-    db->entries[db->count].data = (uint8_t*)malloc(len);
-    db->entries[db->count].len  = len;
-    memcpy(db->entries[db->count].data, data, len);
-    db->count++;
-    return 0;
-}
-static int sk_load_fn(void *ud, const char *name, uint32_t dev,
-                       const uint8_t dist[16], uint8_t **out, size_t *out_len) {
-    sk_db_t *db = (sk_db_t*)ud;
-    for (int i = 0; i < db->count; i++) {
-        if (strcmp(db->entries[i].name, name) == 0 && db->entries[i].dev == dev &&
-            memcmp(db->entries[i].dist, dist, 16) == 0) {
-            *out     = (uint8_t*)malloc(db->entries[i].len);
-            *out_len = db->entries[i].len;
-            memcpy(*out, db->entries[i].data, db->entries[i].len);
-            return 0;
-        }
+
+    kv_t bob_sess = {0}, bob_pk = {0}, bob_spk = {0}, bob_kpk = {0};
+    bob_keys_t bob; setup_bob(&bob, &bob_pk, &bob_spk, &bob_kpk);
+
+    SignalMutPointerSignalPreKeyRecord opk_r = {NULL};
+    MUST(pk_load(&opk_r, bob.opk_id, &bob_pk));
+    SignalMutPointerSignalPublicKey opk_pub = {NULL};
+    MUST(signal_pre_key_record_get_public_key(&opk_pub,
+             (SignalConstPointerSignalPreKeyRecord){opk_r.raw}));
+    signal_pre_key_record_destroy(opk_r);
+
+    SignalMutPointerSignalSignedPreKeyRecord spk_r = {NULL};
+    MUST(spk_load(&spk_r, bob.spk_id, &bob_spk));
+    SignalMutPointerSignalPublicKey spk_pub = {NULL};
+    MUST(signal_signed_pre_key_record_get_public_key(&spk_pub,
+             (SignalConstPointerSignalSignedPreKeyRecord){spk_r.raw}));
+    SignalOwnedBuffer spk_sig = {0};
+    MUST(signal_signed_pre_key_record_get_signature(&spk_sig,
+             (SignalConstPointerSignalSignedPreKeyRecord){spk_r.raw}));
+    signal_signed_pre_key_record_destroy(spk_r);
+
+    SignalMutPointerSignalKyberPreKeyRecord kpk_r = {NULL};
+    MUST(kpk_load(&kpk_r, bob.kpk_id, &bob_kpk));
+    SignalMutPointerSignalKyberPublicKey kpk_pub = {NULL};
+    MUST(signal_kyber_pre_key_record_get_public_key(&kpk_pub,
+             (SignalConstPointerSignalKyberPreKeyRecord){kpk_r.raw}));
+    SignalOwnedBuffer kpk_sig = {0};
+    MUST(signal_kyber_pre_key_record_get_signature(&kpk_sig,
+             (SignalConstPointerSignalKyberPreKeyRecord){kpk_r.raw}));
+    signal_kyber_pre_key_record_destroy(kpk_r);
+
+    SignalMutPointerSignalPrivateKey bob_id_priv_obj = {NULL};
+    MUST(signal_privatekey_deserialize(&bob_id_priv_obj,
+             (SignalBorrowedBuffer){bob.id_priv, 32}));
+    SignalMutPointerSignalPublicKey bob_id_pub = {NULL};
+    MUST(signal_privatekey_get_public_key(&bob_id_pub,
+             (SignalConstPointerSignalPrivateKey){bob_id_priv_obj.raw}));
+    signal_privatekey_destroy(bob_id_priv_obj);
+
+    SignalMutPointerSignalPreKeyBundle bundle = {NULL};
+    MUST(signal_pre_key_bundle_new(&bundle,
+             bob.reg_id, 1,
+             bob.opk_id, true, (SignalConstPointerSignalPublicKey){opk_pub.raw},
+             bob.spk_id, (SignalConstPointerSignalPublicKey){spk_pub.raw},
+             (SignalBorrowedBuffer){spk_sig.base, spk_sig.length},
+             (SignalConstPointerSignalPublicKey){bob_id_pub.raw},
+             bob.kpk_id, true, (SignalConstPointerSignalKyberPublicKey){kpk_pub.raw},
+             (SignalBorrowedBuffer){kpk_sig.base, kpk_sig.length}));
+    signal_publickey_destroy(opk_pub); signal_publickey_destroy(spk_pub);
+    signal_free_buffer(spk_sig.base, spk_sig.length);
+    signal_kyber_public_key_destroy(kpk_pub);
+    signal_free_buffer(kpk_sig.base, kpk_sig.length);
+    signal_publickey_destroy(bob_id_pub);
+
+    kv_t alice_sess = {0}, alice_pk = {0}, alice_spk = {0}, alice_kpk = {0};
+    id_state_t alice_id = {0}; memcpy(alice_id.priv_bytes, alice_id_priv, 32); alice_id.reg_id = 1001;
+    id_state_t bob_id_s = {0}; memcpy(bob_id_s.priv_bytes, bob.id_priv, 32); bob_id_s.reg_id = bob.reg_id;
+
+    SignalMutPointerSignalProtocolAddress bob_addr = {NULL};
+    MUST(signal_address_new(&bob_addr, "bob", 1));
+    SignalMutPointerSignalProtocolAddress alice_addr = {NULL};
+    MUST(signal_address_new(&alice_addr, "alice", 1));
+
+    SignalSessionStore      a_ss  = make_sess(&alice_sess);
+    SignalIdentityKeyStore  a_is  = make_id(&alice_id);
+    SignalPreKeyStore       a_pks = make_pk(&alice_pk);
+    SignalSignedPreKeyStore a_sks = make_spk(&alice_spk);
+    SignalKyberPreKeyStore  a_kks = make_kpk(&alice_kpk);
+
+    MUST(signal_process_prekey_bundle(
+             (SignalConstPointerSignalPreKeyBundle){bundle.raw},
+             (SignalConstPointerSignalProtocolAddress){bob_addr.raw},
+             &a_ss, &a_is, &a_pks, &a_sks, &a_kks));
+    signal_pre_key_bundle_destroy(bundle);
+
+    const uint8_t pt1[] = "hello bob";
+    SignalMutPointerSignalCiphertextMessage ct1 = {NULL};
+    MUST(signal_encrypt_message(&ct1, (SignalBorrowedBuffer){pt1, sizeof pt1 - 1},
+             (SignalConstPointerSignalProtocolAddress){bob_addr.raw},
+             &a_ss, &a_is, &a_pks, &a_sks));
+    SignalOwnedBuffer ct1_b = {0};
+    MUST(signal_ciphertext_message_serialize(&ct1_b,
+             (SignalConstPointerSignalCiphertextMessage){ct1.raw}));
+    signal_ciphertext_message_destroy(ct1);
+
+    SignalMutPointerSignalPreKeySignalMessage pksm = {NULL};
+    MUST(signal_pre_key_signal_message_deserialize(&pksm,
+             (SignalBorrowedBuffer){ct1_b.base, ct1_b.length}));
+    signal_free_buffer(ct1_b.base, ct1_b.length);
+
+    SignalSessionStore      b_ss  = make_sess(&bob_sess);
+    SignalIdentityKeyStore  b_is  = make_id(&bob_id_s);
+    SignalPreKeyStore       b_pks = make_pk(&bob_pk);
+    SignalSignedPreKeyStore b_sks = make_spk(&bob_spk);
+    SignalKyberPreKeyStore  b_kks = make_kpk(&bob_kpk);
+
+    SignalOwnedBuffer dec1 = {0};
+    MUST(signal_decrypt_pre_key_message(&dec1,
+             (SignalConstPointerSignalPreKeySignalMessage){pksm.raw},
+             (SignalConstPointerSignalProtocolAddress){alice_addr.raw},
+             &b_ss, &b_is, &b_pks, &b_sks, &b_kks));
+    signal_pre_key_signal_message_destroy(pksm);
+
+    if (dec1.length != sizeof pt1 - 1 || memcmp(dec1.base, pt1, dec1.length) != 0) {
+        fputs("[FAIL] pre-key plaintext mismatch\n", stderr); abort();
     }
-    return -6;
+    signal_free_buffer(dec1.base, dec1.length);
+
+    const uint8_t pt2[] = "hey alice";
+    SignalMutPointerSignalCiphertextMessage ct2 = {NULL};
+    MUST(signal_encrypt_message(&ct2, (SignalBorrowedBuffer){pt2, sizeof pt2 - 1},
+             (SignalConstPointerSignalProtocolAddress){alice_addr.raw},
+             &b_ss, &b_is, &b_pks, &b_sks));
+    SignalOwnedBuffer ct2_b = {0};
+    MUST(signal_ciphertext_message_serialize(&ct2_b,
+             (SignalConstPointerSignalCiphertextMessage){ct2.raw}));
+    signal_ciphertext_message_destroy(ct2);
+
+    SignalMutPointerSignalMessage whisper = {NULL};
+    MUST(signal_message_deserialize(&whisper,
+             (SignalBorrowedBuffer){ct2_b.base, ct2_b.length}));
+    signal_free_buffer(ct2_b.base, ct2_b.length);
+
+    SignalOwnedBuffer dec2 = {0};
+    MUST(signal_decrypt_message(&dec2,
+             (SignalConstPointerSignalMessage){whisper.raw},
+             (SignalConstPointerSignalProtocolAddress){bob_addr.raw},
+             &a_ss, &a_is));
+    signal_message_destroy(whisper);
+
+    if (dec2.length != sizeof pt2 - 1 || memcmp(dec2.base, pt2, dec2.length) != 0) {
+        fputs("[FAIL] whisper plaintext mismatch\n", stderr); abort();
+    }
+    signal_free_buffer(dec2.base, dec2.length);
+
+    signal_address_destroy(bob_addr); signal_address_destroy(alice_addr);
+    kv_free(&alice_sess); kv_free(&alice_pk); kv_free(&alice_spk); kv_free(&alice_kpk);
+    kv_free(&alice_id.trusted);
+    kv_free(&bob_sess);   kv_free(&bob_pk);   kv_free(&bob_spk);   kv_free(&bob_kpk);
+    kv_free(&bob_id_s.trusted);
+    printf("X3DH + PQXDH + Double Ratchet PASS\n");
 }
 
-static libsignal_sender_key_store_t make_sk_store(sk_db_t *db) {
-    libsignal_sender_key_store_t s;
-    s.ud    = db;
-    s.store = sk_store_fn;
-    s.load  = sk_load_fn;
-    return s;
+static void run_test_group(void) {
+    static const uint8_t dist_id[16] = {
+        0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,
+        0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10
+    };
+    kv_t alice_sk = {0}, bob_sk = {0};
+    SignalSenderKeyStore a_store = make_sk(&alice_sk);
+    SignalSenderKeyStore b_store = make_sk(&bob_sk);
+
+    SignalMutPointerSignalProtocolAddress alice_addr = {NULL};
+    MUST(signal_address_new(&alice_addr, "alice", 1));
+    SignalConstPointerSignalProtocolAddress ca = {alice_addr.raw};
+
+    SignalMutPointerSignalSenderKeyDistributionMessage skdm = {NULL};
+    MUST(signal_sender_key_distribution_message_create(&skdm, ca,
+             (SignalBorrowedBuffer){dist_id, 16}, &a_store));
+    MUST(signal_process_sender_key_distribution_message(ca,
+             (SignalConstPointerSignalSenderKeyDistributionMessage){skdm.raw}, &b_store));
+    signal_sender_key_distribution_message_destroy(skdm);
+
+    const uint8_t msg[] = "group hello";
+    SignalOwnedBuffer enc = {0};
+    MUST(signal_group_encrypt_message(&enc, ca, (SignalBorrowedBuffer){dist_id, 16},
+             (SignalBorrowedBuffer){msg, sizeof msg - 1}, &a_store));
+
+    SignalOwnedBuffer dec = {0};
+    MUST(signal_group_decrypt_message(&dec, ca,
+             (SignalBorrowedBuffer){dist_id, 16},
+             (SignalBorrowedBuffer){enc.base, enc.length}, &b_store));
+    signal_free_buffer(enc.base, enc.length);
+
+    if (dec.length != sizeof msg - 1 || memcmp(dec.base, msg, dec.length) != 0) {
+        fputs("[FAIL] group plaintext mismatch\n", stderr); abort();
+    }
+    signal_free_buffer(dec.base, dec.length);
+    signal_address_destroy(alice_addr);
+    kv_free(&alice_sk); kv_free(&bob_sk);
+    printf("Sender Keys (group)           PASS\n");
 }
 
-static sk_db_t *new_sk_db(void) {
-    return (sk_db_t*)calloc(1, sizeof(sk_db_t));
+static void run_test_fingerprint(void) {
+    SignalMutPointerSignalPrivateKey pa = {NULL}, pb = {NULL};
+    MUST(signal_privatekey_generate(&pa));
+    MUST(signal_privatekey_generate(&pb));
+    SignalMutPointerSignalPublicKey qa = {NULL}, qb = {NULL};
+    MUST(signal_privatekey_get_public_key(&qa, (SignalConstPointerSignalPrivateKey){pa.raw}));
+    MUST(signal_privatekey_get_public_key(&qb, (SignalConstPointerSignalPrivateKey){pb.raw}));
+    signal_privatekey_destroy(pa); signal_privatekey_destroy(pb);
+
+    static const uint8_t alice_id[] = "+15551234567";
+    static const uint8_t bob_id[]   = "+15559876543";
+    SignalBorrowedBuffer aid = {alice_id, sizeof alice_id - 1};
+    SignalBorrowedBuffer bid = {bob_id,   sizeof bob_id   - 1};
+
+    SignalMutPointerSignalFingerprint fp_a = {NULL}, fp_b = {NULL};
+    MUST(signal_fingerprint_new(&fp_a, 5200, 0, aid,
+             (SignalConstPointerSignalPublicKey){qa.raw}, bid,
+             (SignalConstPointerSignalPublicKey){qb.raw}));
+    MUST(signal_fingerprint_new(&fp_b, 5200, 0, bid,
+             (SignalConstPointerSignalPublicKey){qb.raw}, aid,
+             (SignalConstPointerSignalPublicKey){qa.raw}));
+    signal_publickey_destroy(qa); signal_publickey_destroy(qb);
+
+    SignalOwnedBuffer scan_b = {0};
+    MUST(signal_fingerprint_scannable_encoding(&scan_b,
+             (SignalConstPointerSignalFingerprint){fp_b.raw}));
+
+    bool match = false;
+    MUST(signal_fingerprint_compare(&match,
+             (SignalConstPointerSignalFingerprint){fp_a.raw},
+             (SignalBorrowedBuffer){scan_b.base, scan_b.length}));
+    if (!match) { fputs("[FAIL] fingerprint compare failed\n", stderr); abort(); }
+    signal_free_buffer(scan_b.base, scan_b.length);
+    signal_fingerprint_destroy(fp_a); signal_fingerprint_destroy(fp_b);
+    printf("Fingerprints                  PASS\n");
 }
-static void free_sk_db(sk_db_t *db) {
-    for (int i = 0; i < db->count; i++) free(db->entries[i].data);
-    free(db);
+
+static void run_test_username(void) {
+    uint8_t hash[32];
+    MUST(signal_username_hash(hash, "alice.42"));
+    SignalOwnedBuffer proof = {0};
+    MUST(signal_username_proof(&proof, "alice.42"));
+    bool valid = false;
+    MUST(signal_username_verify(&valid, hash,
+             (SignalBorrowedBuffer){proof.base, proof.length}));
+    if (!valid) { fputs("[FAIL] username proof invalid\n", stderr); abort(); }
+    signal_free_buffer(proof.base, proof.length);
+    printf("Username ZK proof             PASS\n");
+}
+
+static void run_test_account_keys(void) {
+    SignalMutPointerSignalAccountEntropyPool pool = {NULL};
+    MUST(signal_account_entropy_pool_generate(&pool));
+    SignalConstPointerSignalAccountEntropyPool cp = {pool.raw};
+
+    const char *s = NULL;
+    MUST(signal_account_entropy_pool_as_string(&s, cp));
+    printf("  Entropy pool: %.16s…\n", s);
+    signal_free_string((char *)s);
+
+    uint8_t svr[32], bk_bytes[32];
+    MUST(signal_account_entropy_pool_derive_svr_key(svr, cp));
+    MUST(signal_account_entropy_pool_derive_backup_key(bk_bytes, cp));
+    signal_account_entropy_pool_destroy(pool);
+
+    if (memcmp(svr, bk_bytes, 32) == 0) {
+        fputs("[FAIL] svr_key == backup_key\n", stderr); abort();
+    }
+    SignalMutPointerSignalBackupKey bk = {NULL};
+    MUST(signal_backup_key_from_bytes(&bk, (SignalBorrowedBuffer){bk_bytes, 32}));
+    uint8_t media[32];
+    MUST(signal_backup_key_derive_media_encryption_key(media,
+             (SignalConstPointerSignalBackupKey){bk.raw}));
+    signal_backup_key_destroy(bk);
+    if (memcmp(bk_bytes, media, 32) == 0) {
+        fputs("[FAIL] backup_key == media_key\n", stderr); abort();
+    }
+    printf("Account entropy pool          PASS\n");
 }
 */
 import "C"
 
-import (
-	"crypto/rand"
-	"fmt"
-	"log"
-	"unsafe"
-)
-
-func must(rc C.int, label string) {
-	if rc != 0 {
-		log.Fatalf("[FAIL] %s: error code %d", label, int(rc))
-	}
-}
-
-// ── Section 1: EC key generation, DH, XEdDSA sign/verify ───────────────────
-
-func testEC() {
-	var pubA, pubB [33]C.uint8_t
-	var privA, privB [32]C.uint8_t
-	must(C.libsignal_ec_keypair_generate(&pubA[0], &privA[0]), "ec_keypair_generate A")
-	must(C.libsignal_ec_keypair_generate(&pubB[0], &privB[0]), "ec_keypair_generate B")
-
-	var sharedA, sharedB [32]C.uint8_t
-	must(C.libsignal_ec_dh(&pubB[0], &privA[0], &sharedA[0]), "ec_dh A->B")
-	must(C.libsignal_ec_dh(&pubA[0], &privB[0], &sharedB[0]), "ec_dh B->A")
-	if sharedA != sharedB {
-		log.Fatalf("[FAIL] ec_dh: DH outputs do not match")
-	}
-
-	msg := []byte("hello signal")
-	var sig [64]C.uint8_t
-	must(C.libsignal_xeddsa_sign(&privA[0],
-		(*C.uint8_t)(unsafe.Pointer(&msg[0])), C.size_t(len(msg)),
-		&sig[0]), "xeddsa_sign")
-	must(C.libsignal_xeddsa_verify(&pubA[0],
-		(*C.uint8_t)(unsafe.Pointer(&msg[0])), C.size_t(len(msg)),
-		&sig[0]), "xeddsa_verify")
-
-	// Corrupted signature must fail
-	sig[0] ^= 0xFF
-	rc := C.libsignal_xeddsa_verify(&pubA[0],
-		(*C.uint8_t)(unsafe.Pointer(&msg[0])), C.size_t(len(msg)),
-		&sig[0])
-	if rc == 0 {
-		log.Fatalf("[FAIL] xeddsa_verify: accepted corrupted signature")
-	}
-
-	fmt.Println("PASS ec_keypair_generate / ec_dh / xeddsa_sign / xeddsa_verify")
-}
-
-// ── Section 2: ML-KEM-1024 encap/decap ─────────────────────────────────────
-
-func testKyber() {
-	pub := (*C.uint8_t)(C.malloc(C.LIBSIGNAL_KYBER1024_PK_LEN))
-	sec := (*C.uint8_t)(C.malloc(C.LIBSIGNAL_KYBER1024_SK_LEN))
-	defer C.free(unsafe.Pointer(pub))
-	defer C.free(unsafe.Pointer(sec))
-
-	must(C.libsignal_kyber1024_keypair_generate(pub, sec), "kyber_keypair_generate")
-
-	var ct [C.LIBSIGNAL_KYBER1024_CT_LEN]C.uint8_t
-	var ssEnc [C.LIBSIGNAL_KYBER1024_SS_LEN]C.uint8_t
-	must(C.libsignal_kyber1024_encaps(pub, &ct[0], &ssEnc[0]), "kyber_encaps")
-
-	var ssDec [C.LIBSIGNAL_KYBER1024_SS_LEN]C.uint8_t
-	must(C.libsignal_kyber1024_decaps(sec, &ct[0], &ssDec[0]), "kyber_decaps")
-
-	if ssEnc != ssDec {
-		log.Fatalf("[FAIL] kyber encap/decap: shared secrets do not match")
-	}
-	fmt.Println("PASS kyber1024_keypair_generate / kyber1024_encaps / kyber1024_decaps")
-}
-
-// ── Section 3: Double Ratchet session (Alice sends to Bob) ──────────────────
-
-func testSession() {
-	// Bob's identity + pre-keys
-	bobID := (*C.id_state_t)(C.calloc(1, C.sizeof_id_state_t))
-	defer C.free(unsafe.Pointer(bobID))
-	bobID.reg_id = 1234
-	must(C.libsignal_ec_keypair_generate(&bobID.id_pub[0], &bobID.id_priv[0]), "bob id keypair")
-
-	pkBob := (*C.pk_state_t)(C.calloc(1, C.sizeof_pk_state_t))
-	defer C.free(unsafe.Pointer(pkBob))
-	pkBob.id = 1
-	must(C.libsignal_ec_keypair_generate(&pkBob.pub[0], &pkBob.priv[0]), "bob prekey")
-
-	spkBob := (*C.spk_state_t)(C.calloc(1, C.sizeof_spk_state_t))
-	defer C.free(unsafe.Pointer(spkBob))
-	spkBob.id = 10
-	must(C.libsignal_ec_keypair_generate(&spkBob.pub[0], &spkBob.priv[0]), "bob spk")
-	must(C.libsignal_xeddsa_sign(&bobID.id_priv[0], &spkBob.pub[0],
-		C.LIBSIGNAL_EC_PUBLIC_KEY_LEN, &spkBob.sig[0]), "sign spk")
-
-	// Alice's identity
-	aliceID := (*C.id_state_t)(C.calloc(1, C.sizeof_id_state_t))
-	defer C.free(unsafe.Pointer(aliceID))
-	aliceID.reg_id = 5678
-	must(C.libsignal_ec_keypair_generate(&aliceID.id_pub[0], &aliceID.id_priv[0]), "alice id keypair")
-
-	// Shared session DB (Alice encrypts, Bob decrypts — same in-memory store)
-	aliceSessDB := C.new_session_db()
-	defer C.free_session_db(aliceSessDB)
-	bobSessDB := C.new_session_db()
-	defer C.free_session_db(bobSessDB)
-
-	// Alice context: targeting "bob"/device 1
-	aliceCtx := C.libsignal_ctx_new(
-		C.CString("bob"), 1,
-		C.make_sess_store(aliceSessDB),
-		C.make_id_store(aliceID),
-		C.make_pk_store(pkBob), // Alice needs Bob's pre-keys to build the bundle
-		C.make_spk_store(spkBob),
-		nil,
-	)
-	if aliceCtx == nil {
-		log.Fatalf("[FAIL] libsignal_ctx_new alice returned nil")
-	}
-	defer C.libsignal_ctx_free(aliceCtx)
-
-	// Alice processes Bob's pre-key bundle
-	must(C.libsignal_process_prekey_bundle(
-		aliceCtx,
-		bobID.reg_id,
-		pkBob.id, &pkBob.pub[0],
-		spkBob.id, &spkBob.pub[0], &spkBob.sig[0],
-		&bobID.id_pub[0],
-		0, nil, nil,
-	), "process_prekey_bundle")
-
-	// Alice encrypts first message (PreKey message)
-	plaintext := []byte("Hello Bob from Alice!")
-	var ctPtr *C.uint8_t
-	var ctLen C.size_t
-	var msgType C.int
-	must(C.libsignal_encrypt(aliceCtx,
-		(*C.uint8_t)(unsafe.Pointer(&plaintext[0])), C.size_t(len(plaintext)),
-		&ctPtr, &ctLen, &msgType), "encrypt")
-	defer C.free(unsafe.Pointer(ctPtr))
-
-	if msgType != C.LIBSIGNAL_MSG_PREKEY {
-		log.Fatalf("[FAIL] expected PREKEY msg type, got %d", int(msgType))
-	}
-
-	// Bob context: targeting "alice"/device 1
-	pkBobForDecrypt := (*C.pk_state_t)(C.calloc(1, C.sizeof_pk_state_t))
-	defer C.free(unsafe.Pointer(pkBobForDecrypt))
-	*pkBobForDecrypt = *pkBob
-
-	spkBobForDecrypt := (*C.spk_state_t)(C.calloc(1, C.sizeof_spk_state_t))
-	defer C.free(unsafe.Pointer(spkBobForDecrypt))
-	*spkBobForDecrypt = *spkBob
-
-	bobCtx := C.libsignal_ctx_new(
-		C.CString("alice"), 1,
-		C.make_sess_store(bobSessDB),
-		C.make_id_store(bobID),
-		C.make_pk_store(pkBobForDecrypt),
-		C.make_spk_store(spkBobForDecrypt),
-		nil,
-	)
-	if bobCtx == nil {
-		log.Fatalf("[FAIL] libsignal_ctx_new bob returned nil")
-	}
-	defer C.libsignal_ctx_free(bobCtx)
-
-	var ptPtr *C.uint8_t
-	var ptLen C.size_t
-	must(C.libsignal_decrypt_prekey(bobCtx, ctPtr, ctLen, &ptPtr, &ptLen), "decrypt_prekey")
-	defer C.free(unsafe.Pointer(ptPtr))
-
-	recovered := C.GoStringN((*C.char)(unsafe.Pointer(ptPtr)), C.int(ptLen))
-	if recovered != string(plaintext) {
-		log.Fatalf("[FAIL] session decrypt: got %q, want %q", recovered, string(plaintext))
-	}
-
-	// Follow-up whisper message (ratchet advances): Bob replies to Alice
-	// For this we need Bob's stored session to be stored and Alice to have received the prekey
-	// The above roundtrip is the full session establishment — that suffices for the PREKEY path.
-	fmt.Println("PASS ctx_new / process_prekey_bundle / encrypt / decrypt_prekey")
-}
-
-// ── Section 4: Group messaging (Sender Key) ─────────────────────────────────
-
-func testGroup() {
-	distID := [16]C.uint8_t{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-	// Each participant has their own sender key database — they must not share one,
-	// as processSession would overwrite the sender's record (with real private key)
-	// with a recipient-view record (public key only), breaking subsequent encryption.
-	aliceDB := C.new_sk_db()
-	defer C.free_sk_db(aliceDB)
-	bobDB := C.new_sk_db()
-	defer C.free_sk_db(bobDB)
-
-	senderName := C.CString("alice")
-	defer C.free(unsafe.Pointer(senderName))
-
-	// Alice creates the sender key session using her own DB
-	var skdmPtr *C.uint8_t
-	var skdmLen C.size_t
-	must(C.libsignal_group_create_session(senderName, 1, &distID[0],
-		C.make_sk_store(aliceDB), &skdmPtr, &skdmLen), "group_create_session")
-	defer C.free(unsafe.Pointer(skdmPtr))
-
-	// Bob processes the SKDM into his own DB
-	must(C.libsignal_group_process_session(senderName, 1, skdmPtr, skdmLen,
-		C.make_sk_store(bobDB)), "group_process_session")
-
-	// Alice encrypts (from her DB, which has her full signing key pair)
-	msg := []byte("Group message from Alice!")
-	var ctPtr *C.uint8_t
-	var ctLen C.size_t
-	must(C.libsignal_group_encrypt(senderName, 1, &distID[0],
-		(*C.uint8_t)(unsafe.Pointer(&msg[0])), C.size_t(len(msg)),
-		C.make_sk_store(aliceDB), &ctPtr, &ctLen), "group_encrypt")
-	defer C.free(unsafe.Pointer(ctPtr))
-
-	// Bob decrypts (from his DB, which has Alice's signing public key)
-	var ptPtr *C.uint8_t
-	var ptLen C.size_t
-	must(C.libsignal_group_decrypt(senderName, 1, &distID[0],
-		ctPtr, ctLen, C.make_sk_store(bobDB), &ptPtr, &ptLen), "group_decrypt")
-	defer C.free(unsafe.Pointer(ptPtr))
-
-	recovered := C.GoStringN((*C.char)(unsafe.Pointer(ptPtr)), C.int(ptLen))
-	if recovered != string(msg) {
-		log.Fatalf("[FAIL] group decrypt: got %q, want %q", recovered, string(msg))
-	}
-	fmt.Println("PASS group_create_session / group_process_session / group_encrypt / group_decrypt")
-}
-
-// ── Section 5: Sealed sender V1 ─────────────────────────────────────────────
-
-func testSealedSenderV1() {
-	var trPriv [32]C.uint8_t
-	var serverPub [33]C.uint8_t
-	var serverPriv [32]C.uint8_t
-	var recvPub [33]C.uint8_t
-	var recvPriv [32]C.uint8_t
-	var senderPub [33]C.uint8_t
-	var senderPriv [32]C.uint8_t
-	var trPub [33]C.uint8_t
-
-	must(C.libsignal_ec_keypair_generate(&trPub[0], &trPriv[0]), "trust root keypair")
-	must(C.libsignal_ec_keypair_generate(&serverPub[0], &serverPriv[0]), "server cert keypair")
-	must(C.libsignal_ec_keypair_generate(&recvPub[0], &recvPriv[0]), "recipient keypair")
-	must(C.libsignal_ec_keypair_generate(&senderPub[0], &senderPriv[0]), "sender keypair")
-	_ = trPub
-	_ = senderPriv
-
-	var scertPtr *C.uint8_t
-	var scertLen C.size_t
-	must(C.libsignal_server_cert_serialize(42, &serverPub[0], &trPriv[0],
-		&scertPtr, &scertLen), "server_cert_serialize")
-	defer C.free(unsafe.Pointer(scertPtr))
-
-	senderUUID := C.CString("11111111-1111-1111-1111-111111111111")
-	defer C.free(unsafe.Pointer(senderUUID))
-
-	var sendercertPtr *C.uint8_t
-	var sendercertLen C.size_t
-	must(C.libsignal_sender_cert_serialize(
-		senderUUID, nil, 1,
-		&senderPub[0],
-		2000000000,
-		scertPtr, scertLen,
-		&serverPriv[0],
-		&sendercertPtr, &sendercertLen,
-	), "sender_cert_serialize")
-	defer C.free(unsafe.Pointer(sendercertPtr))
-
-	plaintext := []byte("Sealed V1 payload")
-	var ctPtr *C.uint8_t
-	var ctLen C.size_t
-	must(C.libsignal_sealed_sender_encrypt(
-		&recvPub[0],
-		sendercertPtr, sendercertLen,
-		1, 0, nil,
-		(*C.uint8_t)(unsafe.Pointer(&plaintext[0])), C.size_t(len(plaintext)),
-		&ctPtr, &ctLen,
-	), "sealed_sender_encrypt")
-	defer C.free(unsafe.Pointer(ctPtr))
-
-	var uuidPtr, e164Ptr, contentsPtr *C.uint8_t
-	var uuidLen, e164Len, contentsLen C.size_t
-	var devID C.uint32_t
-	var contentType C.uint8_t
-	must(C.libsignal_sealed_sender_decrypt(
-		ctPtr, ctLen, &recvPriv[0],
-		&uuidPtr, &uuidLen,
-		&e164Ptr, &e164Len,
-		&devID, &contentType,
-		&contentsPtr, &contentsLen,
-	), "sealed_sender_decrypt")
-	defer C.free(unsafe.Pointer(uuidPtr))
-	if e164Ptr != nil {
-		defer C.free(unsafe.Pointer(e164Ptr))
-	}
-	defer C.free(unsafe.Pointer(contentsPtr))
-
-	recovered := C.GoStringN((*C.char)(unsafe.Pointer(contentsPtr)), C.int(contentsLen))
-	if recovered != string(plaintext) {
-		log.Fatalf("[FAIL] sealed V1 decrypt: got %q, want %q", recovered, string(plaintext))
-	}
-	gotUUID := C.GoStringN((*C.char)(unsafe.Pointer(uuidPtr)), C.int(uuidLen))
-	if gotUUID != "11111111-1111-1111-1111-111111111111" {
-		log.Fatalf("[FAIL] sealed V1 sender UUID: got %q", gotUUID)
-	}
-	fmt.Println("PASS server_cert_serialize / sender_cert_serialize / sealed_sender_encrypt / sealed_sender_decrypt")
-}
-
-// ── Section 6: Sealed sender V2 ─────────────────────────────────────────────
-
-func testSealedSenderV2() {
-	var senderPub [33]C.uint8_t
-	var senderPriv [32]C.uint8_t
-	var recipientPub [33]C.uint8_t
-	var recipientPriv [32]C.uint8_t
-	must(C.libsignal_ec_keypair_generate(&senderPub[0], &senderPriv[0]), "v2 sender keypair")
-	must(C.libsignal_ec_keypair_generate(&recipientPub[0], &recipientPriv[0]), "v2 recipient keypair")
-
-	// Build recipient descriptor: ACI service_id (type 0x00 || 16 random UUID bytes)
-	var recip C.libsignal_sealed_sender_v2_recipient_t
-	recip.service_id_fixed[0] = 0x00 // ACI
-	for i := 1; i < 17; i++ {
-		recip.service_id_fixed[i] = C.uint8_t(i)
-	}
-	recip.device_id = 1
-	for i := 0; i < 33; i++ {
-		recip.identity_pub[i] = recipientPub[i]
-	}
-
-	msg := []byte("Sealed V2 multi-recipient payload")
-	var sentPtr *C.uint8_t
-	var sentLen C.size_t
-	must(C.libsignal_sealed_sender_encrypt_v2(
-		(*C.uint8_t)(unsafe.Pointer(&msg[0])), C.size_t(len(msg)),
-		&senderPriv[0], &senderPub[0],
-		&recip, 1,
-		nil, 0,
-		&sentPtr, &sentLen,
-	), "sealed_sender_encrypt_v2")
-	defer C.free(unsafe.Pointer(sentPtr))
-
-	// Server dispatch: convert 0x23 sent message → 0x22 received message for our recipient
-	var recvPtr *C.uint8_t
-	var recvLen C.size_t
-	must(C.libsignal_sealed_sender_v2_dispatch(
-		sentPtr, sentLen,
-		&recip.service_id_fixed[0],
-		recip.device_id,
-		&recvPtr, &recvLen,
-	), "sealed_sender_v2_dispatch")
-	defer C.free(unsafe.Pointer(recvPtr))
-
-	var ptPtr *C.uint8_t
-	var ptLen C.size_t
-	must(C.libsignal_sealed_sender_decrypt_v2(
-		recvPtr, recvLen,
-		&recipientPriv[0], &recipientPub[0],
-		&senderPub[0],
-		&ptPtr, &ptLen,
-	), "sealed_sender_decrypt_v2")
-	defer C.free(unsafe.Pointer(ptPtr))
-
-	recovered := C.GoStringN((*C.char)(unsafe.Pointer(ptPtr)), C.int(ptLen))
-	if recovered != string(msg) {
-		log.Fatalf("[FAIL] sealed V2 decrypt: got %q, want %q", recovered, string(msg))
-	}
-	fmt.Println("PASS sealed_sender_encrypt_v2 / v2_dispatch / sealed_sender_decrypt_v2")
-}
-
-// ── Section 7: Fingerprint compute + compare ────────────────────────────────
-
-func testFingerprint() {
-	var alicePub [33]C.uint8_t
-	var alicePriv [32]C.uint8_t
-	var bobPub [33]C.uint8_t
-	var bobPriv [32]C.uint8_t
-	must(C.libsignal_ec_keypair_generate(&alicePub[0], &alicePriv[0]), "fp alice keypair")
-	must(C.libsignal_ec_keypair_generate(&bobPub[0], &bobPriv[0]), "fp bob keypair")
-	_ = alicePriv
-	_ = bobPriv
-
-	aliceID := []byte("+14151234567")
-	bobID := []byte("+14159876543")
-
-	var aliceDisplayable [60]C.uint8_t
-	var aliceScannablePtr *C.uint8_t
-	var aliceScannableLen C.size_t
-	must(C.libsignal_fingerprint_compute(
-		&alicePub[0],
-		(*C.uint8_t)(unsafe.Pointer(&aliceID[0])), C.size_t(len(aliceID)),
-		&bobPub[0],
-		(*C.uint8_t)(unsafe.Pointer(&bobID[0])), C.size_t(len(bobID)),
-		&aliceDisplayable[0],
-		&aliceScannablePtr, &aliceScannableLen,
-	), "fingerprint_compute alice")
-	defer C.free(unsafe.Pointer(aliceScannablePtr))
-
-	var bobDisplayable [60]C.uint8_t
-	var bobScannablePtr *C.uint8_t
-	var bobScannableLen C.size_t
-	must(C.libsignal_fingerprint_compute(
-		&bobPub[0],
-		(*C.uint8_t)(unsafe.Pointer(&bobID[0])), C.size_t(len(bobID)),
-		&alicePub[0],
-		(*C.uint8_t)(unsafe.Pointer(&aliceID[0])), C.size_t(len(aliceID)),
-		&bobDisplayable[0],
-		&bobScannablePtr, &bobScannableLen,
-	), "fingerprint_compute bob")
-	defer C.free(unsafe.Pointer(bobScannablePtr))
-
-	if aliceDisplayable != bobDisplayable {
-		log.Fatalf("[FAIL] fingerprint displayable strings do not match")
-	}
-
-	var match C.int
-	must(C.libsignal_fingerprint_compare(
-		aliceScannablePtr, aliceScannableLen,
-		bobScannablePtr, bobScannableLen,
-		&match,
-	), "fingerprint_compare")
-	if match != 1 {
-		log.Fatalf("[FAIL] fingerprint_compare returned no match")
-	}
-	fmt.Println("PASS fingerprint_compute / fingerprint_compare")
-}
-
-// ── Section 8: Username hash + ZK proof + verify ────────────────────────────
-
-func testUsername() {
-	username := C.CString("alice.42")
-	defer C.free(unsafe.Pointer(username))
-
-	var hash [32]C.uint8_t
-	must(C.libsignal_username_hash(username, &hash[0]), "username_hash")
-
-	randBytes := make([]byte, 32)
-	if _, err := rand.Read(randBytes); err != nil {
-		log.Fatalf("[FAIL] rand.Read: %v", err)
-	}
-	var randomness [32]C.uint8_t
-	for i, b := range randBytes {
-		randomness[i] = C.uint8_t(b)
-	}
-
-	var proof [128]C.uint8_t
-	must(C.libsignal_username_proof(username, &randomness[0], &proof[0]), "username_proof")
-
-	var valid C.int
-	must(C.libsignal_username_verify(&hash[0], &proof[0], &valid), "username_verify")
-	if valid != 1 {
-		log.Fatalf("[FAIL] username_verify returned invalid for correct proof")
-	}
-
-	// Corrupt one hash byte — must fail
-	hash[0] ^= 0xFF
-	must(C.libsignal_username_verify(&hash[0], &proof[0], &valid), "username_verify corrupted hash")
-	if valid != 0 {
-		log.Fatalf("[FAIL] username_verify accepted proof against wrong hash")
-	}
-	fmt.Println("PASS username_hash / username_proof / username_verify")
-}
-
-// ── Section 9: AccountEntropyPool generate / parse / derive ─────────────────
-
-func testAccountKeys() {
-	var pool [64]C.uint8_t
-	C.libsignal_account_entropy_pool_generate(&pool[0])
-	must(C.libsignal_account_entropy_pool_parse(&pool[0]), "account_entropy_pool_parse")
-
-	var svrKey [32]C.uint8_t
-	must(C.libsignal_account_entropy_derive_svr_key(&pool[0], &svrKey[0]),
-		"account_entropy_derive_svr_key")
-
-	var backupKey [32]C.uint8_t
-	must(C.libsignal_account_entropy_derive_backup_key(&pool[0], &backupKey[0]),
-		"account_entropy_derive_backup_key")
-
-	var mediaKey [32]C.uint8_t
-	C.libsignal_backup_key_derive_media_key(&backupKey[0], &mediaKey[0])
-
-	// Determinism: same pool yields same SVR key
-	var svrKey2 [32]C.uint8_t
-	must(C.libsignal_account_entropy_derive_svr_key(&pool[0], &svrKey2[0]),
-		"account_entropy_derive_svr_key repeat")
-	if svrKey != svrKey2 {
-		log.Fatalf("[FAIL] account_entropy_derive_svr_key is not deterministic")
-	}
-
-	// All-zero pool must be rejected
-	var badPool [64]C.uint8_t
-	rc := C.libsignal_account_entropy_pool_parse(&badPool[0])
-	if rc == 0 {
-		log.Fatalf("[FAIL] account_entropy_pool_parse accepted all-zero pool")
-	}
-	fmt.Println("PASS account_entropy_pool_generate / parse / derive_svr_key / derive_backup_key / backup_key_derive_media_key")
-}
+import "fmt"
 
 func main() {
-	testEC()
-	testKyber()
-	testSession()
-	testGroup()
-	testSealedSenderV1()
-	testSealedSenderV2()
-	testFingerprint()
-	testUsername()
-	testAccountKeys()
-
-	fmt.Println("\nAll C FFI tests PASSED.")
+	C.run_test_ec_keys()
+	C.run_test_kyber_keys()
+	C.run_test_session()
+	C.run_test_group()
+	C.run_test_fingerprint()
+	C.run_test_username()
+	C.run_test_account_keys()
+	fmt.Println("\nAll signal_ffi tests PASSED.")
 }
